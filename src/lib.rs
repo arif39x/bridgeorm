@@ -1,126 +1,162 @@
-mod db;
-mod models;
-mod logger;
-mod transaction;
-mod introspect;
-mod loader;
-mod relations;
+mod engine;
+mod schema;
+mod telemetry;
 
 use pyo3::prelude::*;
 use pyo3::exceptions::PyException;
-use sqlx::{AnyPool, Error as SqlxError};
+use sqlx::AnyPool;
 use once_cell::sync::Lazy;
-use tokio::runtime::Runtime;
 use std::collections::HashMap;
-use uuid::Uuid;
-use transaction::TxHandle;
-use introspect::ColumnMeta;
+use engine::transaction::TxHandle;
 
-static RUNTIME: Lazy<Runtime> = Lazy::new(|| Runtime::new().expect("Failed to create Tokio runtime"));
 static POOL: Lazy<std::sync::RwLock<Option<AnyPool>>> = Lazy::new(|| std::sync::RwLock::new(None));
 
 #[pyfunction]
 fn configure_logging(level: String, slow_query_ms: u64) {
-    logger::configure_logging(&level, slow_query_ms);
+    telemetry::logger::configure_logging(&level, slow_query_ms);
 }
 
 #[pyfunction]
-fn begin_transaction() -> PyResult<TxHandle> {
+fn begin_transaction(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
     let pool_guard = POOL.read().unwrap();
-    let pool = pool_guard.as_ref().ok_or_else(|| PyException::new_err("Connection pool not initialized"))?;
+    let pool = pool_guard.as_ref().ok_or_else(|| PyException::new_err("Connection pool not initialized"))?.clone();
     
-    let tx = RUNTIME.block_on(pool.begin())
-        .map_err(rust_error_to_python)?;
-    
-    Ok(TxHandle {
-        inner: Some(tx),
-        savepoint_depth: 0,
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let tx = pool.begin()
+            .await
+            .map_err(engine::db::rust_error_to_python)?;
+        
+        Ok(TxHandle {
+            inner: std::sync::Arc::new(tokio::sync::Mutex::new(Some(tx))),
+            savepoint_depth: 0,
+        })
     })
 }
 
 #[pyfunction]
-fn reflect_table(table_name: String) -> PyResult<Vec<ColumnMeta>> {
+fn reflect_table(py: Python<'_>, table_name: String) -> PyResult<Bound<'_, PyAny>> {
     let pool_guard = POOL.read().unwrap();
-    let pool = pool_guard.as_ref().ok_or_else(|| PyException::new_err("Connection pool not initialized"))?;
+    let pool = pool_guard.as_ref().ok_or_else(|| PyException::new_err("Connection pool not initialized"))?.clone();
     
-    RUNTIME.block_on(introspect::reflect_table(pool, &table_name))
-        .map_err(rust_error_to_python)
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let res = schema::introspect::reflect_table(&pool, &table_name)
+            .await
+            .map_err(engine::db::rust_error_to_python)?;
+        Ok(res)
+    })
 }
 
 #[pyfunction]
-fn connect(url: String) -> PyResult<()> {
-    let pool = RUNTIME.block_on(db::connect(&url))
-        .map_err(rust_error_to_python)?;
-    let mut p = POOL.write().unwrap();
-    *p = Some(pool);
-    Ok(())
+fn connect(py: Python<'_>, url: String) -> PyResult<Bound<'_, PyAny>> {
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let pool = engine::db::connect(&url)
+            .await
+            .map_err(engine::db::rust_error_to_python)?;
+        let mut p = POOL.write().unwrap();
+        *p = Some(pool);
+        Ok(())
+    })
 }
 
 #[pyfunction]
-fn create_user(username: String, email: String) -> PyResult<models::User> {
+#[pyo3(signature = (table, data, tx=None))]
+fn insert_row(py: Python<'_>, table: String, data: HashMap<String, String>, tx: Option<TxHandle>) -> PyResult<Bound<'_, PyAny>> {
+    let pool_guard = POOL.read().unwrap();
+    let pool = pool_guard.as_ref().ok_or_else(|| PyException::new_err("Connection pool not initialized"))?.clone();
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let res = if let Some(tx_handle) = tx {
+            let mut guard = tx_handle.inner.lock().await;
+            let transaction = guard.as_mut().ok_or_else(|| PyException::new_err("Transaction closed"))?;
+            engine::db::generic_insert_in_tx(transaction, &table, data).await?
+        } else {
+            engine::db::generic_insert(&pool, &table, data).await?
+        };
+        Ok(res)
+    })
+}
+
+#[pyfunction]
+#[pyo3(signature = (table, filters))]
+fn find_one(py: Python<'_>, table: String, filters: HashMap<String, String>) -> PyResult<Bound<'_, PyAny>> {
+    let pool_guard = POOL.read().unwrap();
+    let pool = pool_guard.as_ref().ok_or_else(|| PyException::new_err("Connection pool not initialized"))?.clone();
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let res = engine::db::generic_query(&pool, &table, filters, Some(1)).await?;
+        if res.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(res[0].clone()))
+        }
+    })
+}
+
+#[pyfunction]
+#[pyo3(signature = (table, filters, limit=None))]
+fn fetch_all(py: Python<'_>, table: String, filters: HashMap<String, String>, limit: Option<i64>) -> PyResult<Bound<'_, PyAny>> {
+    let pool_guard = POOL.read().unwrap();
+    let pool = pool_guard.as_ref().ok_or_else(|| PyException::new_err("Connection pool not initialized"))?.clone();
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let res = engine::db::generic_query(&pool, &table, filters, limit).await?;
+        Ok(res)
+    })
+}
+
+#[pyfunction]
+#[pyo3(signature = (table, filters, limit=None))]
+fn fetch_lazy(table: String, filters: HashMap<String, String>, limit: Option<i64>) -> PyResult<engine::db::LazyRowStream> {
     let pool_guard = POOL.read().unwrap();
     let pool = pool_guard.as_ref().ok_or_else(|| PyException::new_err("Connection pool not initialized"))?;
-    RUNTIME.block_on(db::create_user(pool, &username, &email))
-        .map_err(rust_error_to_python)
+    engine::db::query_lazy(pool, &table, filters, limit)
 }
 
 #[pyfunction]
-fn find_user_by_id(id: String) -> PyResult<Option<models::User>> {
-    let uuid = Uuid::parse_str(&id).map_err(|_| PyException::new_err("Invalid UUID format"))?;
+fn execute_raw(py: Python<'_>, sql: String) -> PyResult<Bound<'_, PyAny>> {
     let pool_guard = POOL.read().unwrap();
-    let pool = pool_guard.as_ref().ok_or_else(|| PyException::new_err("Connection pool not initialized"))?;
-    RUNTIME.block_on(db::find_user_by_id(pool, uuid))
-        .map_err(rust_error_to_python)
+    let pool = pool_guard.as_ref().ok_or_else(|| PyException::new_err("Connection pool not initialized"))?.clone();
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        engine::db::execute_raw(&pool, &sql)
+            .await
+            .map_err(engine::db::rust_error_to_python)?;
+        Ok(())
+    })
 }
 
 #[pyfunction]
-fn create_post(title: String, user_id: String) -> PyResult<models::Post> {
-    let uuid = Uuid::parse_str(&user_id).map_err(|_| PyException::new_err("Invalid UUID format"))?;
-    let pool_guard = POOL.read().unwrap();
-    let pool = pool_guard.as_ref().ok_or_else(|| PyException::new_err("Connection pool not initialized"))?;
-    RUNTIME.block_on(db::create_post(pool, &title, uuid))
-        .map_err(rust_error_to_python)
+fn resolve_type(py_type: String, dialect: String) -> PyResult<String> {
+    engine::db::resolve_python_type_to_sql(&py_type, &dialect)
 }
 
 #[pyfunction]
-fn load_related_posts(user_id: String) -> PyResult<Vec<models::Post>> {
-    let uuid = Uuid::parse_str(&user_id).map_err(|_| PyException::new_err("Invalid UUID format"))?;
+#[pyo3(signature = (table, items, tx=None))]
+fn insert_rows_bulk(py: Python<'_>, table: String, items: Vec<HashMap<String, String>>, tx: Option<TxHandle>) -> PyResult<Bound<'_, PyAny>> {
     let pool_guard = POOL.read().unwrap();
-    let pool = pool_guard.as_ref().ok_or_else(|| PyException::new_err("Connection pool not initialized"))?;
-    RUNTIME.block_on(db::load_related_posts(pool, uuid))
-        .map_err(rust_error_to_python)
+    let pool = pool_guard.as_ref().ok_or_else(|| PyException::new_err("Connection pool not initialized"))?.clone();
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let res = engine::db::generic_bulk_insert(&pool, &table, items).await?;
+        Ok(res)
+    })
 }
 
 #[pyfunction]
-fn query_users(filters: HashMap<String, String>, limit: Option<i64>) -> PyResult<Vec<models::User>> {
-    let pool_guard = POOL.read().unwrap();
-    let pool = pool_guard.as_ref().ok_or_else(|| PyException::new_err("Connection pool not initialized"))?;
-    RUNTIME.block_on(db::query_users(pool, filters, limit))
-        .map_err(rust_error_to_python)
-}
-
-fn rust_error_to_python(err: SqlxError) -> PyErr {
-    match err {
-        SqlxError::RowNotFound => PyErr::new::<pyo3::exceptions::PyKeyError, _>("Resource not found"),
-        SqlxError::Database(e) if e.is_unique_violation() => PyErr::new::<pyo3::exceptions::PyValueError, _>("Database constraint violation"),
-        _ => PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!("Database error: {}", err)),
-    }
+fn set_telemetry_logger(logger: PyObject) {
+    telemetry::logger::set_python_logger(logger);
 }
 
 #[pymodule]
 fn bridge_orm_rs(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<TxHandle>()?;
-    m.add_class::<ColumnMeta>()?;
+    m.add_class::<engine::db::LazyRowStream>()?;
+    m.add_function(wrap_pyfunction!(set_telemetry_logger, m)?)?;
     m.add_function(wrap_pyfunction!(configure_logging, m)?)?;
     m.add_function(wrap_pyfunction!(begin_transaction, m)?)?;
     m.add_function(wrap_pyfunction!(reflect_table, m)?)?;
     m.add_function(wrap_pyfunction!(connect, m)?)?;
-    m.add_function(wrap_pyfunction!(create_user, m)?)?;
-    m.add_function(wrap_pyfunction!(find_user_by_id, m)?)?;
-    m.add_function(wrap_pyfunction!(create_post, m)?)?;
-    m.add_function(wrap_pyfunction!(load_related_posts, m)?)?;
-    m.add_function(wrap_pyfunction!(query_users, m)?)?;
-    m.add_class::<models::User>()?;
-    m.add_class::<models::Post>()?;
+    m.add_function(wrap_pyfunction!(insert_row, m)?)?;
+    m.add_function(wrap_pyfunction!(find_one, m)?)?;
+    m.add_function(wrap_pyfunction!(fetch_all, m)?)?;
+    m.add_function(wrap_pyfunction!(fetch_lazy, m)?)?;
+    m.add_function(wrap_pyfunction!(execute_raw, m)?)?;
+    m.add_function(wrap_pyfunction!(resolve_type, m)?)?;
+    m.add_function(wrap_pyfunction!(insert_rows_bulk, m)?)?;
     Ok(())
 }

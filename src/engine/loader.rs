@@ -12,8 +12,8 @@ pub async fn batch_load(
     // Whitelist check for child_table and foreign_key should happen before this call.
 
     // Building a SELECT ... WHERE foreign_key IN (...) query.
-    // We use a workaround for AnyPool if it doesn't support array binding easily.
-    // For this prototype, we'll implement the logic conceptually.
+    // a workaround for AnyPool if it doesn't support array binding easily.
+    // For this prototype,implement the logic conceptually.
 
     let mut results: HashMap<Uuid, Vec<sqlx::any::AnyRow>> = HashMap::new();
     for id in parent_ids {
@@ -21,7 +21,7 @@ pub async fn batch_load(
             "SELECT * FROM {} WHERE {} = $1",
             child_table, foreign_key
         ))
-        .bind(id)
+        .bind(id.to_string())
         .fetch_all(pool)
         .await?;
         results.insert(*id, rows);

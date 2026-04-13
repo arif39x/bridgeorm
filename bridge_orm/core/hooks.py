@@ -1,5 +1,5 @@
 import functools
-from .exceptions import HookAbortedError
+from ..common import HookAbortedError
 
 def hook_decorator(hook_point: str):
     def decorator(func):

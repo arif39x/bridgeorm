@@ -1,26 +1,63 @@
 import bridge_orm_rs
-from .base import BaseModel
-from .exceptions import BridgeORMError, ConnectionError, QueryError, NotFoundError, ConstraintError, HookAbortedError
-from .transaction import transaction
+import logging
+
+from .core import BaseModel, transaction
+from .common import (
+    BridgeORMError, ConnectionError, QueryError, NotFoundError, 
+    ConstraintError, HookAbortedError
+)
+
+# Setup internal telemetry bridge
+class TelemetryBridge:
+    def __init__(self):
+        self.logger = logging.getLogger("bridge_orm.telemetry")
+
+    def handle_telemetry(self, event: dict):
+        """Standard handler for Rust telemetry events."""
+        msg = f"[{event['operation']}] {event['table']} | {event['duration_micros']}μs | SQL: {event['sql']}"
+        if event['duration_micros'] > 100000: # 100ms
+            self.logger.warning(f"SLOW QUERY: {msg}")
+        else:
+            self.logger.debug(msg)
+
+_bridge = TelemetryBridge()
+bridge_orm_rs.set_telemetry_logger(_bridge)
 
 async def connect(url: str):
     """Initialise the database connection pool."""
-    return bridge_orm_rs.connect(url)
+    return await bridge_orm_rs.connect(url)
+
+async def execute_raw(sql: str):
+    """Execute raw SQL statement."""
+    return await bridge_orm_rs.execute_raw(sql)
+
 
 def configure_logging(level: str = "info", slow_query_ms: int = 100):
     """Configure structured query logging."""
     bridge_orm_rs.configure_logging(level, slow_query_ms)
 
-# Re-expose model classes with metadata
+# Pre-defined models for convenience
 class User(BaseModel):
     table = "users"
     _fields = ["id", "username", "email", "created_at", "updated_at"]
 
+    id: str
+    username: str
+    email: str
+    created_at: str
+    updated_at: str
+
     async def load_related(self, model_class):
         if model_class.__name__ == "Post":
-            return bridge_orm_rs.load_related_posts(str(self.id))
+            return await bridge_orm_rs.load_related_posts(str(self.id))
         return []
 
 class Post(BaseModel):
     table = "posts"
     _fields = ["id", "title", "user_id", "created_at", "updated_at"]
+
+    id: str
+    title: str
+    user_id: str
+    created_at: str
+    updated_at: str

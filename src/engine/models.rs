@@ -1,33 +1,31 @@
-use chrono::{DateTime, Utc};
 use pyo3::prelude::*;
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
-use uuid::Uuid;
 
 #[pyclass]
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct BaseModelFields {
     #[pyo3(get)]
-    pub id: Uuid,
+    pub id: String,
     #[pyo3(get)]
-    pub created_at: DateTime<Utc>,
+    pub created_at: String,
     #[pyo3(get)]
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: String,
 }
 
 #[pyclass]
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct User {
     #[pyo3(get)]
-    pub id: Uuid,
+    pub id: String,
     #[pyo3(get)]
     pub username: String,
     #[pyo3(get)]
     pub email: String,
     #[pyo3(get)]
-    pub created_at: DateTime<Utc>,
+    pub created_at: String,
     #[pyo3(get)]
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: String,
 }
 
 #[pymethods]
@@ -44,15 +42,15 @@ impl User {
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct Post {
     #[pyo3(get)]
-    pub id: Uuid,
+    pub id: String,
     #[pyo3(get)]
     pub title: String,
     #[pyo3(get)]
-    pub user_id: Uuid,
+    pub user_id: String,
     #[pyo3(get)]
-    pub created_at: DateTime<Utc>,
+    pub created_at: String,
     #[pyo3(get)]
-    pub updated_at: DateTime<Utc>,
+    pub updated_at: String,
 }
 
 #[pymethods]

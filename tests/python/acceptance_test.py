@@ -1,8 +1,6 @@
 import asyncio
 
-from bridge_orm import connect
-from bridge_orm.exceptions import NotFoundError
-from bridge_orm.models import Post, User
+from bridge_orm import connect, NotFoundError, User, Post
 
 
 async def main():

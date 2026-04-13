@@ -10,7 +10,7 @@ BridgeORM leverages the performance of Rust's `sqlx` and `tokio` while providing
 
 ---
 
-## 🛠 Technical Specifications
+## Technical Specifications
 
 ### Rust Backend (`src/`)
 

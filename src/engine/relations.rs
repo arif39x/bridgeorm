@@ -25,7 +25,7 @@ pub async fn fetch_one_to_many(
         "SELECT * FROM {} WHERE {} = $1",
         child_table, foreign_key
     ))
-    .bind(parent_id)
+    .bind(parent_id.to_string())
     .fetch_all(pool)
     .await
 }
@@ -44,7 +44,7 @@ pub async fn fetch_many_to_many(
          WHERE j.{} = $1",
         target_table, junction_table, right_key, left_key
     ))
-    .bind(parent_id)
+    .bind(parent_id.to_string())
     .fetch_all(pool)
     .await
 }
@@ -59,7 +59,7 @@ pub async fn fetch_self_ref(
         "SELECT * FROM {} WHERE {} = $1",
         table, parent_key
     ))
-    .bind(parent_id)
+    .bind(parent_id.to_string())
     .fetch_all(pool)
     .await
 }

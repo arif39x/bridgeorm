@@ -20,7 +20,7 @@ pub async fn reflect_table(
     pool: &AnyPool,
     table_name: &str,
 ) -> Result<Vec<ColumnMeta>, sqlx::Error> {
-    // For SQLite, information_schema doesn't exist. We'd use PRAGMA table_info(table_name).
+    // For SQLite, information_schema doesn't exist. use PRAGMA table_info(table_name).
     let mut columns = Vec::new();
 
     // Whitelist check would go here in a production system.
