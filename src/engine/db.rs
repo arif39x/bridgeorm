@@ -1,125 +1,156 @@
-// every query in this file uses bound parameters.
+//! Core database engine for BridgeORM.
+//! 
+//! This module is pure Rust and does not depend on PyO3.
+//! All functions return `BridgeOrmResult` and use `#[must_use]`.
+
+use crate::error::{BridgeOrmError, BridgeOrmResult};
 use crate::telemetry::logger::{self, TelemetryEvent};
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use once_cell::sync::Lazy;
-use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyStopAsyncIteration, PyValueError};
-use pyo3::prelude::*;
-use pyo3::types::PyDict;
 use regex::Regex;
-use sqlx::{any::AnyRow, AnyPool, Column, Row};
+use sqlx::{any::AnyRow, AnyPool, Row};
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::Mutex;
+
+/// Constants for SQL validation and formatting.
+const VALID_IDENTIFIER_REGEX: &str = r"^[a-zA-Z_][a-zA-Z0-9_]*$";
+const RESERVED_KEYWORDS: [&str; 8] = [
+    "SELECT", "DROP", "TABLE", "DELETE", "UPDATE", "INSERT", "TRUNCATE", "ALTER",
+];
 
 pub static VALID_SQL_IDENTIFIER_PATTERN: Lazy<Regex> =
-    Lazy::new(|| Regex::new(r"^[a-zA-Z_][a-zA-Z0-9_]*$").unwrap());
+    Lazy::new(|| Regex::new(VALID_IDENTIFIER_REGEX).expect("Invalid hardcoded regex pattern"));
 
-pub fn validate_identifier(id: &str) -> PyResult<()> {
-    if !VALID_SQL_IDENTIFIER_PATTERN.is_match(id) {
-        return Err(PyValueError::new_err(format!(
+/// Represents a parameterized SQL statement.
+/// Rule: All query builders must produce a (sql: &str, params: Vec<Value>) tuple.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SqlStatement {
+    pub sql: String,
+    pub params: Vec<String>,
+}
+
+/// Represents supported SQL dialects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SqlDialect {
+    Postgres,
+    Sqlite,
+    MySql,
+    MsSql,
+}
+
+impl SqlDialect {
+    /// Infers the SQL dialect from the connection URL.
+    #[must_use]
+    pub fn from_url(url: &str) -> Self {
+        if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+            Self::Postgres
+        } else if url.starts_with("sqlite:") {
+            Self::Sqlite
+        } else if url.starts_with("mysql://") || url.starts_with("mariadb://") {
+            Self::MySql
+        } else if url.starts_with("mssql://") || url.starts_with("sqlserver://") {
+            Self::MsSql
+        } else {
+            Self::Postgres
+        }
+    }
+
+    /// Returns the appropriate placeholder for the current dialect.
+    #[must_use]
+    pub fn get_placeholder(&self, index: usize) -> String {
+        match self {
+            Self::Postgres | Self::Sqlite => format!("${}", index + 1),
+            Self::MySql => "?".to_string(),
+            Self::MsSql => format!("@p{}", index + 1),
+        }
+    }
+}
+
+/// Validates that a string is a safe SQL identifier.
+/// Rule: Never silently drop errors.
+#[must_use]
+pub fn validate_identifier(identifier: &str) -> BridgeOrmResult<()> {
+    if !VALID_SQL_IDENTIFIER_PATTERN.is_match(identifier) {
+        return Err(BridgeOrmError::Validation(format!(
             "Security Violation: Invalid SQL identifier '{}'",
-            id
+            identifier
         )));
     }
-    let reserved = [
-        "SELECT", "DROP", "TABLE", "DELETE", "UPDATE", "INSERT", "TRUNCATE", "ALTER",
-    ];
-    if reserved.contains(&id.to_uppercase().as_str()) {
-        return Err(PyValueError::new_err(format!(
+    
+    if RESERVED_KEYWORDS.contains(&identifier.to_uppercase().as_str()) {
+        return Err(BridgeOrmError::Validation(format!(
             "Security Violation: Reserved keyword '{}' used as identifier",
-            id
+            identifier
         )));
     }
     Ok(())
 }
 
-pub async fn connect(url: &str) -> Result<AnyPool, sqlx::Error> {
+/// Establishes a connection pool using the provided URL.
+/// Uses sqlx's built-in pool.
+#[must_use]
+pub async fn connect(url: &str) -> BridgeOrmResult<AnyPool> {
     sqlx::any::install_default_drivers();
-    AnyPool::connect(url).await
+    AnyPool::connect(url).await.map_err(BridgeOrmError::from)
 }
 
-pub async fn execute_raw(pool: &AnyPool, sql: &str) -> Result<(), sqlx::Error> {
+/// Shared logic for building placeholders and values for queries.
+#[must_use]
+fn prepare_statement(
+    dialect: SqlDialect,
+    data: &HashMap<String, String>,
+) -> BridgeOrmResult<(Vec<String>, Vec<String>, Vec<String>)> {
+    let mut columns = Vec::new();
+    let mut values = Vec::new();
+    let mut placeholders = Vec::new();
+
+    for (idx, (col, val)) in data.iter().enumerate() {
+        validate_identifier(col)?;
+        columns.push(col.clone());
+        values.push(val.clone());
+        placeholders.push(dialect.get_placeholder(idx));
+    }
+    Ok((columns, values, placeholders))
+}
+
+/// Helper to convert a database row into a HashMap.
+#[must_use]
+pub fn row_to_map(row: &AnyRow) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for column in row.columns() {
+        let name = column.name();
+        let val: String = row.try_get(name).unwrap_or_default();
+        map.insert(name.to_string(), val);
+    }
+    map
+}
+
+/// Pure Rust implementation of execute_raw.
+#[must_use]
+pub async fn execute_raw(pool: &AnyPool, sql: &str) -> BridgeOrmResult<()> {
     sqlx::query(sql).execute(pool).await?;
     Ok(())
 }
 
+/// Pure Rust generic insert.
+#[must_use]
 pub async fn generic_insert(
     pool: &AnyPool,
-    table: &str,
+    url: &str,
+    table_name: &str,
     data: HashMap<String, String>,
-) -> PyResult<HashMap<String, String>> {
-    validate_identifier(table)?;
-    let mut columns = Vec::new();
-    let mut values = Vec::new();
-    let mut place_holders = Vec::new();
-
-    for (idx, (col, val)) in data.into_iter().enumerate() {
-        validate_identifier(&col)?;
-        columns.push(col);
-        values.push(val);
-        place_holders.push(format!("${}", idx + 1));
-    }
+) -> BridgeOrmResult<HashMap<String, String>> {
+    validate_identifier(table_name)?;
+    let dialect = SqlDialect::from_url(url);
+    let (columns, values, placeholders) = prepare_statement(dialect, &data)?;
 
     let sql = format!(
-        "INSERT INTO {} ({}) VALUES ({}) RETURNING *",
-        table,
+        "INSERT INTO {} ({}) VALUES ({})",
+        table_name,
         columns.join(", "),
-        place_holders.join(", ")
-    );
-
-    let start = Instant::now();
-    let row = sqlx::query(&sql);
-    let mut query = row;
-    for val in &values {
-        query = query.bind(val);
-    }
-
-    let res_row = query
-        .fetch_one(pool)
-        .await
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let duration = start.elapsed();
-
-    logger::emit_telemetry(TelemetryEvent {
-        sql: sql.clone(),
-        duration_micros: duration.as_micros() as u64,
-        operation: "INSERT".to_string(),
-        table: table.to_string(),
-    });
-
-    let mut res = HashMap::new();
-    for column in res_row.columns() {
-        let name = column.name();
-        let val: String = res_row.try_get(name).unwrap_or_default();
-        res.insert(name.to_string(), val);
-    }
-    Ok(res)
-}
-
-pub async fn generic_insert_in_tx(
-    tx: &mut sqlx::Transaction<'static, sqlx::Any>,
-    table: &str,
-    data: HashMap<String, String>,
-) -> PyResult<HashMap<String, String>> {
-    validate_identifier(table)?;
-    let mut columns = Vec::new();
-    let mut values = Vec::new();
-    let mut place_holders = Vec::new();
-
-    for (idx, (col, val)) in data.into_iter().enumerate() {
-        validate_identifier(&col)?;
-        columns.push(col);
-        values.push(val);
-        place_holders.push(format!("${}", idx + 1));
-    }
-
-    let sql = format!(
-        "INSERT INTO {} ({}) VALUES ({}) RETURNING *",
-        table,
-        columns.join(", "),
-        place_holders.join(", ")
+        placeholders.join(", ")
     );
 
     let start = Instant::now();
@@ -128,118 +159,42 @@ pub async fn generic_insert_in_tx(
         query = query.bind(val);
     }
 
-    let res_row = query
-        .fetch_one(&mut **tx)
-        .await
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    query.execute(pool).await?;
+        
     let duration = start.elapsed();
-
     logger::emit_telemetry(TelemetryEvent {
         sql: sql.clone(),
         duration_micros: duration.as_micros() as u64,
-        operation: "INSERT_TX".to_string(),
-        table: table.to_string(),
+        operation: "INSERT".to_string(),
+        table: table_name.to_string(),
     });
 
-    let mut res = HashMap::new();
-    for column in res_row.columns() {
-        let name = column.name();
-        let val: String = res_row.try_get(name).unwrap_or_default();
-        res.insert(name.to_string(), val);
-    }
-    Ok(res)
+    Ok(data)
 }
 
-pub async fn generic_bulk_insert(
-    pool: &AnyPool,
-    table: &str,
-    items: Vec<HashMap<String, String>>,
-) -> PyResult<Vec<HashMap<String, String>>> {
-    validate_identifier(table)?;
-    if items.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let start = Instant::now();
-    let mut tx = pool
-        .begin()
-        .await
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let mut results = Vec::new();
-
-    for data in items {
-        let mut columns = Vec::new();
-        let mut values = Vec::new();
-        let mut place_holders = Vec::new();
-
-        for (idx, (col, val)) in data.into_iter().enumerate() {
-            validate_identifier(&col)?;
-            columns.push(col);
-            values.push(val);
-            place_holders.push(format!("${}", idx + 1));
-        }
-
-        let sql = format!(
-            "INSERT INTO {} ({}) VALUES ({}) RETURNING *",
-            table,
-            columns.join(", "),
-            place_holders.join(", ")
-        );
-
-        let mut query = sqlx::query(&sql);
-        for val in values {
-            query = query.bind(val);
-        }
-
-        let row = query
-            .fetch_one(&mut *tx)
-            .await
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        let mut res = HashMap::new();
-        for column in row.columns() {
-            let name = column.name();
-            let val: String = row.try_get(name).unwrap_or_default();
-            res.insert(name.to_string(), val);
-        }
-        results.push(res);
-    }
-
-    tx.commit()
-        .await
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let duration = start.elapsed();
-
-    logger::emit_telemetry(TelemetryEvent {
-        sql: format!("INSERT BULK {} rows", results.len()),
-        duration_micros: duration.as_micros() as u64,
-        operation: "BULK_INSERT".to_string(),
-        table: table.to_string(),
-    });
-
-    Ok(results)
-}
-
+/// Pure Rust generic query.
+#[must_use]
 pub async fn generic_query(
     pool: &AnyPool,
-    table: &str,
+    url: &str,
+    table_name: &str,
     filters: HashMap<String, String>,
     limit: Option<i64>,
-) -> PyResult<Vec<HashMap<String, String>>> {
-    validate_identifier(table)?;
-    let mut sql = format!("SELECT * FROM {}", table);
-    let mut first = true;
+) -> BridgeOrmResult<Vec<HashMap<String, String>>> {
+    validate_identifier(table_name)?;
+    let dialect = SqlDialect::from_url(url);
+    let mut sql = format!("SELECT * FROM {}", table_name);
     let mut values = Vec::new();
 
-    for (idx, (col, val)) in filters.into_iter().enumerate() {
-        validate_identifier(&col)?;
-        if first {
-            sql.push_str(" WHERE ");
-            first = false;
-        } else {
-            sql.push_str(" AND ");
+    if !filters.is_empty() {
+        sql.push_str(" WHERE ");
+        let mut conditions = Vec::new();
+        for (idx, (col, val)) in filters.iter().enumerate() {
+            validate_identifier(col)?;
+            conditions.push(format!("{} = {}", col, dialect.get_placeholder(idx)));
+            values.push(val.clone());
         }
-        sql.push_str(&format!("{} = ${}", col, idx + 1));
-        values.push(val);
+        sql.push_str(&conditions.join(" AND "));
     }
 
     if let Some(l) = limit {
@@ -252,85 +207,42 @@ pub async fn generic_query(
         query = query.bind(val);
     }
 
-    let rows = query
-        .fetch_all(pool)
-        .await
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let rows = query.fetch_all(pool).await?;
+    
     let duration = start.elapsed();
-
     logger::emit_telemetry(TelemetryEvent {
         sql: sql.clone(),
         duration_micros: duration.as_micros() as u64,
         operation: "SELECT".to_string(),
-        table: table.to_string(),
+        table: table_name.to_string(),
     });
 
-    let mut results = Vec::new();
-    for row in rows {
-        let mut map = HashMap::new();
-        for column in row.columns() {
-            let name = column.name();
-            let val: String = row.try_get(name).unwrap_or_default();
-            map.insert(name.to_string(), val);
-        }
-        results.push(map);
-    }
-    Ok(results)
+    Ok(rows.iter().map(row_to_map).collect())
 }
 
-#[pyclass]
-pub struct LazyRowStream {
-    pub stream: Arc<Mutex<BoxStream<'static, Result<AnyRow, sqlx::Error>>>>,
-}
-
-#[pymethods]
-impl LazyRowStream {
-    fn __aiter__(slf: PyRef<'_, Self>) -> PyRef<'_, Self> {
-        slf
-    }
-
-    fn __anext__<'p>(&self, py: Python<'p>) -> PyResult<Bound<'p, PyAny>> {
-        let stream = self.stream.clone();
-        pyo3_async_runtimes::tokio::future_into_py(py, async move {
-            let mut stream = stream.lock().await;
-            match stream.next().await {
-                Some(Ok(row)) => Python::with_gil(|py| {
-                    let dict = PyDict::new_bound(py);
-                    for column in row.columns() {
-                        let name = column.name();
-                        let val: String = row.try_get(name).unwrap_or_default();
-                        dict.set_item(name, val)?;
-                    }
-                    Ok(dict.to_object(py))
-                }),
-                Some(Err(e)) => Err(PyRuntimeError::new_err(e.to_string())),
-                None => Err(PyStopAsyncIteration::new_err("Stream exhausted")),
-            }
-        })
-    }
-}
-
+/// Pure Rust implementation of lazy query.
+#[must_use]
 pub fn query_lazy(
     pool: &AnyPool,
-    table: &str,
+    url: &str,
+    table_name: &str,
     filters: HashMap<String, String>,
     limit: Option<i64>,
-) -> PyResult<LazyRowStream> {
-    validate_identifier(table)?;
-    let mut sql = format!("SELECT * FROM {}", table);
-    let mut first = true;
+) -> BridgeOrmResult<BoxStream<'static, Result<AnyRow, sqlx::Error>>> {
+    validate_identifier(table_name)?;
+    let dialect = SqlDialect::from_url(url);
+    let mut sql = format!("SELECT * FROM {}", table_name);
     let mut values = Vec::new();
 
-    for (idx, (col, val)) in filters.clone().into_iter().enumerate() {
-        validate_identifier(&col)?;
-        if first {
-            sql.push_str(" WHERE ");
-            first = false;
-        } else {
-            sql.push_str(" AND ");
+    if !filters.is_empty() {
+        sql.push_str(" WHERE ");
+        let mut conditions = Vec::new();
+        for (idx, (col, val)) in filters.iter().enumerate() {
+            validate_identifier(col)?;
+            conditions.push(format!("{} = {}", col, dialect.get_placeholder(idx)));
+            values.push(val.clone());
         }
-        sql.push_str(&format!("{} = ${}", col, idx + 1));
-        values.push(val);
+        sql.push_str(&conditions.join(" AND "));
     }
 
     if let Some(l) = limit {
@@ -351,16 +263,14 @@ pub fn query_lazy(
     })
     .boxed();
 
-    Ok(LazyRowStream {
-        stream: Arc::new(Mutex::new(stream)),
-    })
+    Ok(stream)
 }
 
 /// Resolves a Python type name to its corresponding SQL type for a given dialect.
-pub fn resolve_python_type_to_sql(py_type: &str, dialect: &str) -> PyResult<String> {
+#[must_use]
+pub fn resolve_python_type_to_sql(py_type: &str, dialect: &str) -> BridgeOrmResult<String> {
     let is_optional = py_type.starts_with("Optional[") || py_type.contains("None");
     let base_type = if is_optional {
-        // Simple extraction for prototype: Optional[int] -> int
         py_type
             .replace("Optional[", "")
             .replace("]", "")
@@ -373,30 +283,27 @@ pub fn resolve_python_type_to_sql(py_type: &str, dialect: &str) -> PyResult<Stri
 
     let sql_type = match (base_type.as_str(), dialect.to_lowercase().as_str()) {
         ("str", _) => "TEXT".to_string(),
-        ("int", "postgres") | ("int", "postgresql") => "BIGINT".to_string(),
+        ("int", d) if d.contains("postgres") => "BIGINT".to_string(),
+        ("int", d) if d.contains("mysql") => "BIGINT".to_string(),
         ("int", "sqlite") => "INTEGER".to_string(),
-        ("float", "postgres") | ("float", "postgresql") => "DOUBLE PRECISION".to_string(),
+        ("int", d) if d.contains("mssql") => "BIGINT".to_string(),
+        
+        ("float", d) if d.contains("postgres") => "DOUBLE PRECISION".to_string(),
         ("float", "sqlite") => "REAL".to_string(),
-        ("bool", "postgres") | ("bool", "postgresql") => "BOOLEAN".to_string(),
-        ("bool", "sqlite") => "INTEGER".to_string(), // 0 or 1
-        ("datetime", "postgres") | ("datetime", "postgresql") => {
-            "TIMESTAMP WITH TIME ZONE".to_string()
-        }
-        ("datetime", "sqlite") => "TEXT".to_string(), // ISO 8601
-        ("date", "postgres") | ("date", "postgresql") => "DATE".to_string(),
-        ("date", "sqlite") => "TEXT".to_string(),
+        ("float", d) if d.contains("mysql") => "DOUBLE".to_string(),
+        
+        ("bool", d) if d.contains("postgres") => "BOOLEAN".to_string(),
+        ("bool", "sqlite") | ("bool", _) if dialect.contains("mysql") => "INTEGER".to_string(),
+        
+        ("datetime", d) if d.contains("postgres") => "TIMESTAMP WITH TIME ZONE".to_string(),
+        ("datetime", _) => "TEXT".to_string(),
+        
         ("UUID", _) | ("uuid", _) => {
-            if dialect == "sqlite" {
-                "TEXT".to_string()
-            } else {
-                "UUID".to_string()
-            }
+            if dialect == "sqlite" { "TEXT".to_string() } else { "UUID".to_string() }
         }
-        // Enum support would require inspecting the Enum values,
-        // for now we default to TEXT with a conceptual CHECK constraint.
         (t, _) if t.contains("Enum") => "TEXT".to_string(),
         (unknown, _) => {
-            return Err(PyValueError::new_err(format!(
+            return Err(BridgeOrmError::Validation(format!(
                 "Unsupported Python type '{}'",
                 unknown
             )))
@@ -407,15 +314,5 @@ pub fn resolve_python_type_to_sql(py_type: &str, dialect: &str) -> PyResult<Stri
         Ok(format!("{} NOT NULL", sql_type))
     } else {
         Ok(sql_type)
-    }
-}
-
-pub fn rust_error_to_python(err: sqlx::Error) -> PyErr {
-    match err {
-        sqlx::Error::RowNotFound => PyKeyError::new_err("Resource not found"),
-        sqlx::Error::Database(e) if e.is_unique_violation() => {
-            PyValueError::new_err("Database constraint violation")
-        }
-        _ => PyRuntimeError::new_err(format!("Database error: {}", err)),
     }
 }

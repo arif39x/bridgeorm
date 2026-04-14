@@ -63,6 +63,7 @@ Prisma uses a Rust engine, but it communicates with Python via a local HTTP serv
 ---
 
 ## 5. Future Roadmap (The "Production" Path)
+- **Java & Kotlin Bindings**: Native JNI/Project Panama integration to bring the high-speed Rust engine to the JVM ecosystem.
 - **N+1 Resolution (Eager Loading)**: Automatic `JOIN` generation for related models.
 - **Complex Operators**: Support for `IN`, `LIKE`, `BETWEEN`, and nested `AND/OR` logic.
 - **Connection Pool Tuning**: Deep integration with `sqlx` pool settings (max connections, idle timeout).

@@ -2,22 +2,18 @@ class BridgeORMError(Exception):
     """Base exception for all BridgeORM errors."""
     pass
 
-class ConnectionError(BridgeORMError):
-    """Raised when the database connection pool is not initialized or fails."""
+class NotFoundError(BridgeORMError, KeyError):
+    """Raised when a requested resource is not found in the database."""
     pass
 
-class QueryError(BridgeORMError):
-    """Raised when a query is invalid, e.g., unknown field in filter."""
-    pass
-
-class NotFoundError(BridgeORMError):
-    """Raised when find_one fails to locate a record."""
-    pass
-
-class ConstraintError(BridgeORMError):
-    """Raised when a database constraint (like unique or foreign key) is violated."""
+class ValidationError(BridgeORMError, ValueError):
+    """Raised when data fails validation before database interaction."""
     pass
 
 class HookAbortedError(BridgeORMError):
-    """Raised when a Before* hook returns False and cancels the operation."""
+    """Raised when a pre-save/delete hook aborts the operation."""
+    pass
+
+class DatabaseError(BridgeORMError):
+    """Raised when the database engine returns an error."""
     pass

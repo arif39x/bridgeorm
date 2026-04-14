@@ -54,3 +54,6 @@ Thumbs.db
 *.db
 !tests/**/test.db
 testdb/
+testdb/
+.pyi
+target/
