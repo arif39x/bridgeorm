@@ -1,5 +1,5 @@
-from typing import Any, Dict, List, Optional, Type, get_type_hints
 from contextvars import ContextVar
+from typing import Any, Dict, List, Optional, Type, get_type_hints
 
 import bridge_orm_rs
 
@@ -9,11 +9,14 @@ from .query import QueryBuilder
 
 BULK_INSERT_CHUNK_SIZE = 1000
 
-# Identity Map: Scoped to the current asyncio Task
+# Scoped to the current asyncio Task
 # Maps (table_name, primary_key) -> Model Instance
-_IDENTITY_MAP: ContextVar[Optional[Dict[tuple, Any]]] = ContextVar("identity_map", default=None)
+_IDENTITY_MAP: ContextVar[Optional[Dict[tuple, Any]]] = ContextVar(
+    "identity_map", default=None
+)
 
-_MODEL_REGISTRY: Dict[str, Type['BaseModel']] = {}
+_MODEL_REGISTRY: Dict[str, Type["BaseModel"]] = {}
+
 
 class BaseModel:
     table: str = ""
@@ -53,6 +56,7 @@ class BaseModel:
     def _get_identity_cache(cls) -> Dict[tuple, Any]:
         """Retrieve the identity map for the current task context."""
         import asyncio
+
         current_task = asyncio.current_task()
         if not hasattr(current_task, "_bridge_orm_identity_map"):
             setattr(current_task, "_bridge_orm_identity_map", {})
@@ -72,21 +76,24 @@ class BaseModel:
 
         # Convert kwargs to string map for generic Rust interface
         data = {k: str(v) for k, v in kwargs.items()}
-        
+
         # Add default values if missing (id, created_at, updated_at)
         if "id" not in data:
             import uuid
+
             data["id"] = str(uuid.uuid4())
         if "created_at" not in data:
             from datetime import datetime
+
             data["created_at"] = datetime.now().isoformat()
         if "updated_at" not in data:
             from datetime import datetime
+
             data["updated_at"] = datetime.now().isoformat()
 
         # Call generic Rust insert
         raw_res = await bridge_orm_rs.insert_row(cls.table, data, tx=tx)
-        
+
         # Map back to model instance
         res = cls(**raw_res)
 
@@ -109,25 +116,30 @@ class BaseModel:
                 data = {k: str(v) for k, v in item.items()}
                 if "id" not in data:
                     import uuid
+
                     data["id"] = str(uuid.uuid4())
                 if "created_at" not in data:
                     from datetime import datetime
+
                     data["created_at"] = datetime.now().isoformat()
                 if "updated_at" not in data:
                     from datetime import datetime
+
                     data["updated_at"] = datetime.now().isoformat()
                 prepared_chunk.append(data)
-            
+
             # Single FFI crossing for the entire chunk
-            raw_results = await bridge_orm_rs.insert_rows_bulk(cls.table, prepared_chunk, tx=tx)
-            
+            raw_results = await bridge_orm_rs.insert_rows_bulk(
+                cls.table, prepared_chunk, tx=tx
+            )
+
             # Map back to model instances and populate Identity Map
             cache = cls._get_identity_cache()
             for raw_res in raw_results:
                 instance = cls(**raw_res)
                 cache[(cls.table, str(instance.id))] = instance
                 results.append(instance)
-                
+
         return results
 
     @classmethod
@@ -140,17 +152,17 @@ class BaseModel:
 
         # Convert filters to string map
         filters = {k: str(v) for k, v in kwargs.items()}
-        
+
         raw_res = await bridge_orm_rs.find_one(cls.table, filters)
         if raw_res is None:
             raise NotFoundError(f"No {cls.__name__} found matching {kwargs}")
-        
+
         res = cls(**raw_res)
-        
+
         # Population: Add to cache on miss
         cache = cls._get_identity_cache()
         cache[(cls.table, str(res.id))] = res
-        
+
         return res
 
     def __init__(self, **kwargs):
