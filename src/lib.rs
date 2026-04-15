@@ -1,9 +1,9 @@
 mod engine;
-mod schema;
-mod telemetry;
-mod java_api;
 mod error;
 mod ffi;
+mod java_api;
+mod schema;
+mod telemetry;
 
 pub use error::{BridgeOrmError, BridgeOrmResult};
 

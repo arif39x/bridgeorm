@@ -1,7 +1,6 @@
 use thiserror::Error;
 
 /// Unified error enum for the entire BridgeORM library.
-/// Rule: One unified error enum in error.rs using thiserror.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum BridgeOrmError {
