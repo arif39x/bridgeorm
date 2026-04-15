@@ -1,9 +1,5 @@
-//! Introspection logic for BridgeORM.
-//! 
-//! This module is pure Rust and does not depend on PyO3.
-
-use crate::error::BridgeOrmResult;
 use crate::engine::db::SqlDialect;
+use crate::error::BridgeOrmResult;
 use serde::{Deserialize, Serialize};
 use sqlx::{AnyPool, Row};
 
@@ -25,7 +21,7 @@ pub async fn reflect_table(
     table_name: &str,
 ) -> BridgeOrmResult<Vec<ColumnMeta>> {
     let dialect = SqlDialect::from_url(url);
-    
+
     match dialect {
         SqlDialect::Sqlite => reflect_sqlite(pool, table_name).await,
         _ => reflect_information_schema(pool, table_name).await,
@@ -61,10 +57,7 @@ async fn reflect_information_schema(
 
 /// Specialized introspection for SQLite.
 #[must_use]
-async fn reflect_sqlite(
-    pool: &AnyPool,
-    table_name: &str,
-) -> BridgeOrmResult<Vec<ColumnMeta>> {
+async fn reflect_sqlite(pool: &AnyPool, table_name: &str) -> BridgeOrmResult<Vec<ColumnMeta>> {
     let sql = format!("PRAGMA table_info({})", table_name);
     let rows = sqlx::query(&sql).fetch_all(pool).await?;
 

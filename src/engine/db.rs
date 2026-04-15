@@ -1,15 +1,10 @@
-//! Core database engine for BridgeORM.
-//! 
-//! This module is pure Rust and does not depend on PyO3.
-//! All functions return `BridgeOrmResult` and use `#[must_use]`.
-
 use crate::error::{BridgeOrmError, BridgeOrmResult};
 use crate::telemetry::logger::{self, TelemetryEvent};
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use once_cell::sync::Lazy;
 use regex::Regex;
-use sqlx::{any::AnyRow, AnyPool, Row};
+use sqlx::{any::AnyRow, AnyPool, Column, Row};
 use std::collections::HashMap;
 use std::time::Instant;
 
@@ -23,7 +18,6 @@ pub static VALID_SQL_IDENTIFIER_PATTERN: Lazy<Regex> =
     Lazy::new(|| Regex::new(VALID_IDENTIFIER_REGEX).expect("Invalid hardcoded regex pattern"));
 
 /// Represents a parameterized SQL statement.
-/// Rule: All query builders must produce a (sql: &str, params: Vec<Value>) tuple.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SqlStatement {
     pub sql: String,
@@ -69,7 +63,6 @@ impl SqlDialect {
 }
 
 /// Validates that a string is a safe SQL identifier.
-/// Rule: Never silently drop errors.
 #[must_use]
 pub fn validate_identifier(identifier: &str) -> BridgeOrmResult<()> {
     if !VALID_SQL_IDENTIFIER_PATTERN.is_match(identifier) {
@@ -78,7 +71,7 @@ pub fn validate_identifier(identifier: &str) -> BridgeOrmResult<()> {
             identifier
         )));
     }
-    
+
     if RESERVED_KEYWORDS.contains(&identifier.to_uppercase().as_str()) {
         return Err(BridgeOrmError::Validation(format!(
             "Security Violation: Reserved keyword '{}' used as identifier",
@@ -160,7 +153,7 @@ pub async fn generic_insert(
     }
 
     query.execute(pool).await?;
-        
+
     let duration = start.elapsed();
     logger::emit_telemetry(TelemetryEvent {
         sql: sql.clone(),
@@ -172,6 +165,65 @@ pub async fn generic_insert(
     Ok(data)
 }
 
+/// Pure Rust generic bulk insert.
+#[must_use]
+pub async fn generic_insert_bulk(
+    pool: &AnyPool,
+    url: &str,
+    table_name: &str,
+    items: Vec<HashMap<String, String>>,
+) -> BridgeOrmResult<Vec<HashMap<String, String>>> {
+    validate_identifier(table_name)?;
+    let dialect = SqlDialect::from_url(url);
+
+    if items.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Assume all items have the same keys as the first item for bulk construction
+    let first_item = &items[0];
+    let (columns, _, _) = prepare_statement(dialect, first_item)?;
+
+    let mut sql = format!(
+        "INSERT INTO {} ({}) VALUES ",
+        table_name,
+        columns.join(", ")
+    );
+
+    let mut placeholders = Vec::new();
+    let mut all_values = Vec::new();
+
+    for (row_idx, item) in items.iter().enumerate() {
+        let mut row_placeholders = Vec::new();
+        for (col_idx, col) in columns.iter().enumerate() {
+            let val = item.get(col).cloned().unwrap_or_default();
+            all_values.push(val);
+            row_placeholders.push(dialect.get_placeholder(row_idx * columns.len() + col_idx));
+        }
+        placeholders.push(format!("({})", row_placeholders.join(", ")));
+    }
+
+    sql.push_str(&placeholders.join(", "));
+
+    let start = Instant::now();
+    let mut query = sqlx::query(&sql);
+    for val in &all_values {
+        query = query.bind(val);
+    }
+
+    query.execute(pool).await?;
+
+    let duration = start.elapsed();
+    logger::emit_telemetry(TelemetryEvent {
+        sql: sql.clone(),
+        duration_micros: duration.as_micros() as u64,
+        operation: "BULK_INSERT".to_string(),
+        table: table_name.to_string(),
+    });
+
+    Ok(items)
+}
+
 /// Pure Rust generic query.
 #[must_use]
 pub async fn generic_query(
@@ -180,10 +232,21 @@ pub async fn generic_query(
     table_name: &str,
     filters: HashMap<String, String>,
     limit: Option<i64>,
+    fields: Option<Vec<String>>,
 ) -> BridgeOrmResult<Vec<HashMap<String, String>>> {
     validate_identifier(table_name)?;
     let dialect = SqlDialect::from_url(url);
-    let mut sql = format!("SELECT * FROM {}", table_name);
+
+    let select_clause = if let Some(cols) = &fields {
+        for col in cols {
+            validate_identifier(col)?;
+        }
+        cols.join(", ")
+    } else {
+        "*".to_string()
+    };
+
+    let mut sql = format!("SELECT {} FROM {}", select_clause, table_name);
     let mut values = Vec::new();
 
     if !filters.is_empty() {
@@ -208,7 +271,7 @@ pub async fn generic_query(
     }
 
     let rows = query.fetch_all(pool).await?;
-    
+
     let duration = start.elapsed();
     logger::emit_telemetry(TelemetryEvent {
         sql: sql.clone(),
@@ -228,10 +291,21 @@ pub fn query_lazy(
     table_name: &str,
     filters: HashMap<String, String>,
     limit: Option<i64>,
+    fields: Option<Vec<String>>,
 ) -> BridgeOrmResult<BoxStream<'static, Result<AnyRow, sqlx::Error>>> {
     validate_identifier(table_name)?;
     let dialect = SqlDialect::from_url(url);
-    let mut sql = format!("SELECT * FROM {}", table_name);
+
+    let select_clause = if let Some(cols) = &fields {
+        for col in cols {
+            validate_identifier(col)?;
+        }
+        cols.join(", ")
+    } else {
+        "*".to_string()
+    };
+
+    let mut sql = format!("SELECT {} FROM {}", select_clause, table_name);
     let mut values = Vec::new();
 
     if !filters.is_empty() {
@@ -287,19 +361,23 @@ pub fn resolve_python_type_to_sql(py_type: &str, dialect: &str) -> BridgeOrmResu
         ("int", d) if d.contains("mysql") => "BIGINT".to_string(),
         ("int", "sqlite") => "INTEGER".to_string(),
         ("int", d) if d.contains("mssql") => "BIGINT".to_string(),
-        
+
         ("float", d) if d.contains("postgres") => "DOUBLE PRECISION".to_string(),
         ("float", "sqlite") => "REAL".to_string(),
         ("float", d) if d.contains("mysql") => "DOUBLE".to_string(),
-        
+
         ("bool", d) if d.contains("postgres") => "BOOLEAN".to_string(),
         ("bool", "sqlite") | ("bool", _) if dialect.contains("mysql") => "INTEGER".to_string(),
-        
+
         ("datetime", d) if d.contains("postgres") => "TIMESTAMP WITH TIME ZONE".to_string(),
         ("datetime", _) => "TEXT".to_string(),
-        
+
         ("UUID", _) | ("uuid", _) => {
-            if dialect == "sqlite" { "TEXT".to_string() } else { "UUID".to_string() }
+            if dialect == "sqlite" {
+                "TEXT".to_string()
+            } else {
+                "UUID".to_string()
+            }
         }
         (t, _) if t.contains("Enum") => "TEXT".to_string(),
         (unknown, _) => {

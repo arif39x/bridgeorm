@@ -2,8 +2,20 @@ class BridgeORMError(Exception):
     """Base exception for all BridgeORM errors."""
     pass
 
+class ConnectionError(BridgeORMError):
+    """Raised when database connection fails."""
+    pass
+
+class QueryError(BridgeORMError):
+    """Raised when a database query fails."""
+    pass
+
 class NotFoundError(BridgeORMError, KeyError):
     """Raised when a requested resource is not found in the database."""
+    pass
+
+class ConstraintError(BridgeORMError):
+    """Raised when a database constraint is violated."""
     pass
 
 class ValidationError(BridgeORMError, ValueError):
@@ -16,4 +28,12 @@ class HookAbortedError(BridgeORMError):
 
 class DatabaseError(BridgeORMError):
     """Raised when the database engine returns an error."""
+    pass
+
+class ProjectionError(BridgeORMError, AttributeError):
+    """Raised when accessing an unselected field in a partial model."""
+    pass
+
+class CompositeKeyError(BridgeORMError):
+    """Raised when composite primary key operations fail."""
     pass

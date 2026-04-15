@@ -11,7 +11,7 @@ crate-type = ["cdylib"]
 pyo3       = { version = "0.21", features = ["extension-module"] }
 pyo3-async-runtimes = { version = "0.21", features = ["tokio-runtime"] }
 sqlx       = { version = "0.7",  features = [
-                 "runtime-tokio-rustls", "postgres", "sqlite", "mysql", "mssql",
+                 "runtime-tokio-rustls", "postgres", "sqlite", "mysql",
                  "any", "uuid", "chrono", "json"
                ] }
 tokio      = { version = "1",    features = ["full"] }

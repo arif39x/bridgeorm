@@ -4,7 +4,8 @@ import logging
 from .core import BaseModel, transaction
 from .common import (
     BridgeORMError, ConnectionError, QueryError, NotFoundError, 
-    ConstraintError, HookAbortedError
+    ConstraintError, HookAbortedError, ValidationError, DatabaseError,
+    ProjectionError, CompositeKeyError
 )
 
 # Setup internal telemetry bridge
@@ -48,8 +49,10 @@ class User(BaseModel):
     updated_at: str
 
     async def load_related(self, model_class):
+        # Using the new generic relation fetcher logic if needed, 
+        # but modern code should use RelationDescriptors.
         if model_class.__name__ == "Post":
-            return await bridge_orm_rs.load_related_posts(str(self.id))
+            return await bridge_orm_rs.fetch_one_to_many("posts", "user_id", str(self.id))
         return []
 
 class Post(BaseModel):
