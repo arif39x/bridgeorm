@@ -1,7 +1,7 @@
 import bridge_orm_rs
 import logging
 
-from .core import BaseModel, transaction
+from .core import BaseModel, transaction, HasMany, BelongsToMany, SelfReferential, Session
 from .common import (
     BridgeORMError, ConnectionError, QueryError, NotFoundError, 
     ConstraintError, HookAbortedError, ValidationError, DatabaseError,

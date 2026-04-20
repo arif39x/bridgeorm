@@ -2,7 +2,7 @@ import pytest
 import pytest_asyncio
 import asyncio
 import os
-from bridge_orm import connect, User, execute_raw
+from bridge_orm import connect, User, execute_raw, transaction
 
 @pytest_asyncio.fixture
 async def db_setup(request):
@@ -24,44 +24,37 @@ async def db_setup(request):
         os.remove(db_file)
 
 @pytest.mark.asyncio
-async def test_identity_map_same_task(db_setup):
-    """Verify that fetching the same ID in the same task returns the same object instance."""
-    miku = await User.create(username="Miku", email="miku@vocaloid.com")
-    
-    # First fetch
-    user_a = await User.find_one(id=miku.id)
-    # Second fetch
-    user_b = await User.find_one(id=miku.id)
-    
-    # Assert physical identity (referential integrity)
-    assert user_a is user_b
-    assert id(user_a) == id(user_b)
-    
-    # Mutation on one affects the other (in-memory)
-    user_a.username = "Hatsune Miku"
-    assert user_b.username == "Hatsune Miku"
+async def test_identity_map_same_session(db_setup):
+    """Verify that fetching the same ID in the same session returns the same object instance."""
+    async with transaction() as session:
+        miku = await User.create(username="Miku", email="miku@vocaloid.com", tx=session)
+        
+        # First fetch
+        user_a = await User.find_one(id=miku.id, tx=session)
+        # Second fetch
+        user_b = await User.find_one(id=miku.id, tx=session)
+        
+        # Assert physical identity (referential integrity)
+        assert user_a is user_b
+        assert id(user_a) == id(user_b)
+        
+        # Mutation on one affects the other (in-memory)
+        user_a.username = "Hatsune Miku"
+        assert user_b.username == "Hatsune Miku"
 
 @pytest.mark.asyncio
-async def test_identity_map_different_tasks(db_setup):
-    """Verify that different asyncio tasks have isolated identity maps."""
-    miku = await User.create(username="Miku", email="miku@vocaloid.com")
+async def test_identity_map_different_sessions(db_setup):
+    """Verify that different sessions have isolated identity maps."""
+    async with transaction() as session_setup:
+        miku = await User.create(username="Miku", email="miku@vocaloid.com", tx=session_setup)
     
-    async def get_user_with_sleep():
-        # Force task switching
-        await asyncio.sleep(0.01)
-        u = await User.find_one(id=miku.id)
-        # Manually verify cache content if possible
-        return u
-    
-    # Run two tasks
-    task_a = asyncio.create_task(get_user_with_sleep())
-    task_b = asyncio.create_task(get_user_with_sleep())
-    
-    user_a = await task_a
-    user_b = await task_b
-    
-    # If this fails, it means the test runner might be using a single context 
-    # for all tasks or there's a leak in the ORM.
-    assert user_a.id == user_b.id
-    # We'll use id() check for clarity
-    assert id(user_a) != id(user_b)
+    async with transaction() as session_a:
+        user_a = await User.find_one(id=miku.id, tx=session_a)
+        
+        async with transaction() as session_b:
+            user_b = await User.find_one(id=miku.id, tx=session_b)
+            
+            assert user_a.id == user_b.id
+            # They should be different instances
+            assert user_a is not user_b
+            assert id(user_a) != id(user_b)

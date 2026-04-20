@@ -1,13 +1,13 @@
 from contextlib import asynccontextmanager
-import bridge_orm_rs
+from .session import begin_session
 
 @asynccontextmanager
 async def transaction():
-    """Async context manager for atomic database transactions."""
-    tx = await bridge_orm_rs.begin_transaction()
+    """Async context manager for atomic database transactions and session lifecycle."""
+    session = await begin_session()
     try:
-        yield tx
-        await tx.commit()
+        yield session
+        await session.commit()
     except Exception as e:
-        await tx.rollback()
+        await session.rollback()
         raise e

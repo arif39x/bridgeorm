@@ -34,6 +34,14 @@ impl TxHandle {
     }
 }
 
+pub async fn begin_transaction(pool: &sqlx::AnyPool) -> Result<TxHandle, sqlx::Error> {
+    let tx = pool.begin().await?;
+    Ok(TxHandle {
+        inner: Arc::new(Mutex::new(Some(tx))),
+        savepoint_depth: 0,
+    })
+}
+
 pub fn validate_savepoint_name(name: &str) -> PyResult<()> {
     let re = regex::Regex::new(r"^[a-zA-Z_][a-zA-Z0-9_]*$").unwrap();
     if !re.is_match(name) {

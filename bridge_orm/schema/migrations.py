@@ -27,59 +27,74 @@ class MigrationEngine:
         with open(SCHEMA_SNAPSHOT, "w") as f:
             json.dump(snapshot, f, indent=4)
 
-    def generate_migration(self, description: str = "auto_migration"):
-        current_snapshot = self.load_snapshot()
-        new_tables = {}
+    async def generate_migration(self, description: str = "auto_migration"):
+        # 1. Introspect actual database state
+        db_schema = await bridge_orm_rs.reflect_schema()
+        db_tables = {t.name: t for t in db_schema}
 
-        # Discover current models
+        # 2. Get desired state from models
+        model_tables = {}
         for table_name, model_cls in _MODEL_REGISTRY.items():
-            new_tables[table_name] = model_cls.get_field_definitions()
+            model_tables[table_name] = model_cls.get_field_definitions()
 
-        # Diffing logic
+        # 3. Diffing logic
         sql_statements = []
+        warnings = []
 
-        # Detect New Tables
-        for table_name, fields in new_tables.items():
-            if table_name not in current_snapshot["tables"]:
-                sql = self._generate_create_table(table_name, fields)
+        # Detect New Tables or Changes in Existing Tables
+        for table_name, model_fields in model_tables.items():
+            if table_name not in db_tables:
+                sql = self._generate_create_table(table_name, model_fields)
                 sql_statements.append(sql)
             else:
-                # Detect New Columns in existing tables
-                old_fields = current_snapshot["tables"][table_name]
-                for field_name, field_type in fields.items():
-                    if field_name not in old_fields:
+                # Table exists, check columns
+                db_table = db_tables[table_name]
+                db_column_names = {c.name for c in db_table.columns}
+                
+                # New Columns
+                for field_name, field_type in model_fields.items():
+                    if field_name not in db_column_names:
                         sql_type = bridge_orm_rs.resolve_type(field_type, self.dialect)
                         sql_statements.append(
                             f"ALTER TABLE {table_name} ADD COLUMN {field_name} {sql_type};"
                         )
+                
+                # Missing Columns in Model (Dropped or Manual)
+                model_column_names = set(model_fields.keys())
+                for db_col in db_table.columns:
+                    if db_col.name not in model_column_names:
+                        warnings.append(
+                            f"Warning: Column '{db_col.name}' exists in database table '{table_name}' but is not defined in the model."
+                        )
 
-                # Detect Dropped Columns
-                for field_name in old_fields:
-                    if field_name not in fields:
-                        sql_statements.append(
-                            f"-- WARNING: Detected dropped column '{field_name}' in table '{table_name}'."
-                        )
-                        sql_statements.append(
-                            f"-- ALTER TABLE {table_name} DROP COLUMN {field_name};"
-                        )
+        # Detect Tables in DB but not in Models
+        for db_table_name in db_tables:
+            if db_table_name not in model_tables and not db_table_name.startswith("sqlite_"):
+                warnings.append(
+                    f"Warning: Table '{db_table_name}' exists in database but has no corresponding model."
+                )
+
+        if warnings:
+            print("\nReconciliation Warnings:")
+            for w in warnings:
+                print(f"  - {w}")
 
         if not sql_statements:
-            print("No changes detected.")
+            print("\nNo schema changes needed.")
             return
 
-        # Generate file
+        # 4. Generate file
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         filename = f"{timestamp}_{description}.sql"
         filepath = os.path.join(MIGRATIONS_DIR, filename)
 
         with open(filepath, "w") as f:
+            f.write("-- BridgeORM Reconciliation-based Migration\n")
+            f.write(f"-- Generated: {datetime.now().isoformat()}\n\n")
             f.write("\n".join(sql_statements))
 
-        # Update snapshot
-        current_snapshot["tables"] = new_tables
-        self.save_snapshot(current_snapshot)
-
-        print(f"Created migration: {filepath}")
+        print(f"\nCreated migration: {filepath}")
+        print("Please review the SQL file before applying.")
 
     def _generate_create_table(self, table_name: str, fields: Dict[str, str]) -> str:
         column_defs = []

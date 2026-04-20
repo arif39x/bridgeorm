@@ -11,6 +11,71 @@ pub struct ColumnMeta {
     pub data_type: String,
     pub is_nullable: bool,
     pub is_primary_key: bool,
+    pub default_value: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct IndexMeta {
+    pub name: String,
+    pub columns: Vec<String>,
+    pub is_unique: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TableMeta {
+    pub name: String,
+    pub columns: Vec<ColumnMeta>,
+    pub indexes: Vec<IndexMeta>,
+}
+
+/// Reflects the entire schema of the database.
+#[must_use]
+pub async fn reflect_schema(
+    pool: &AnyPool,
+    url: &str,
+) -> BridgeOrmResult<Vec<TableMeta>> {
+    let dialect = SqlDialect::from_url(url);
+    
+    // Get list of tables
+    let tables: Vec<String> = match dialect {
+        SqlDialect::Sqlite => {
+            sqlx::query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
+                .fetch_all(pool)
+                .await?
+                .into_iter()
+                .map(|r| r.get(0))
+                .collect()
+        }
+        SqlDialect::Postgres => {
+            sqlx::query("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'")
+                .fetch_all(pool)
+                .await?
+                .into_iter()
+                .map(|r| r.get(0))
+                .collect()
+        }
+        _ => {
+            sqlx::query("SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE()")
+                .fetch_all(pool)
+                .await?
+                .into_iter()
+                .map(|r| r.get(0))
+                .collect()
+        }
+    };
+
+    let mut schema = Vec::new();
+    for table_name in tables {
+        let columns = reflect_table(pool, url, &table_name).await?;
+        // For indexes, we'd need dialect-specific logic here too.
+        // Simplified for now.
+        schema.push(TableMeta {
+            name: table_name,
+            columns,
+            indexes: Vec::new(),
+        });
+    }
+    Ok(schema)
 }
 
 /// Reflects table metadata based on the database dialect.
@@ -35,7 +100,7 @@ async fn reflect_information_schema(
     table_name: &str,
 ) -> BridgeOrmResult<Vec<ColumnMeta>> {
     let rows = sqlx::query(
-        "SELECT column_name, data_type, is_nullable
+        "SELECT column_name, data_type, is_nullable, column_default
          FROM information_schema.columns
          WHERE table_name = $1",
     )
@@ -49,7 +114,8 @@ async fn reflect_information_schema(
             name: row.get("column_name"),
             data_type: row.get("data_type"),
             is_nullable: row.get::<String, _>("is_nullable") == "YES",
-            is_primary_key: false, // Simplified for prototype
+            is_primary_key: false, // Would need to query information_schema.key_column_usage
+            default_value: row.try_get("column_default").ok(),
         });
     }
     Ok(columns)
@@ -68,6 +134,7 @@ async fn reflect_sqlite(pool: &AnyPool, table_name: &str) -> BridgeOrmResult<Vec
             data_type: row.get("type"),
             is_nullable: row.get::<i32, _>("notnull") == 0,
             is_primary_key: row.get::<i32, _>("pk") == 1,
+            default_value: row.try_get("dflt_value").ok(),
         });
     }
     Ok(columns)

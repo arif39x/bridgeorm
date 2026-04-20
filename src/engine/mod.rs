@@ -1,4 +1,9 @@
 pub mod db;
+pub mod query;
 pub mod transaction;
+pub mod session;
+pub mod metadata;
+pub mod hydrator;
+pub mod dirty_tracker;
 pub mod relations;
 pub mod loader;

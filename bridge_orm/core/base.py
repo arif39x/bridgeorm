@@ -1,5 +1,5 @@
 from contextvars import ContextVar
-from typing import Any, Dict, List, Optional, Type, get_type_hints
+from typing import Any, Dict, List, Optional, Type, Union, get_type_hints
 
 import bridge_orm_rs
 
@@ -8,12 +8,6 @@ from .hooks import dispatch_hooks
 from .query import QueryBuilder
 
 BULK_INSERT_CHUNK_SIZE = 1000
-
-# Scoped to the current asyncio Task
-# Maps (table_name, primary_key_tuple) -> Model Instance
-_IDENTITY_MAP: ContextVar[Optional[Dict[tuple, Any]]] = ContextVar(
-    "identity_map", default=None
-)
 
 _MODEL_REGISTRY: Dict[str, Type["BaseModel"]] = {}
 
@@ -28,24 +22,22 @@ class BaseModel:
         super().__init_subclass__(**kwargs)
         if cls.table:
             _MODEL_REGISTRY[cls.table] = cls
-
-    @classmethod
-    def _build_pk_predicate(cls, **kwargs) -> Dict[str, Any]:
-        # Construct a predicate dictionary for primary key lookup
-        missing = [k for k in cls._primary_keys if k not in kwargs]
-        if missing:
-            raise CompositeKeyError(
-                f"Model '{cls.__name__}' requires all primary key fields. "
-                f"Missing: {missing}. Required: {cls._primary_keys}"
-            )
-        return {k: kwargs[k] for k in cls._primary_keys}
-
-    @classmethod
-    def _build_cache_key(cls, **kwargs) -> tuple:
-        # Construct a deterministic cache key from primary key values
-        predicate = cls._build_pk_predicate(**kwargs)
-        # Sort by key name to ensure deterministic tuple
-        return (cls.table, tuple(sorted(predicate.items())))
+            
+            # Register with Rust metadata engine for type-safe hydration
+            try:
+                field_defs = cls.get_field_definitions()
+                columns = []
+                for field in cls._fields:
+                    data_type = field_defs.get(field, "str")
+                    is_nullable = "Optional" in data_type
+                    is_pk = field in cls._primary_keys
+                    columns.append((field, data_type, is_nullable, is_pk))
+                
+                bridge_orm_rs.register_entity(cls.table, columns)
+            except Exception as e:
+                # Log the error but don't crash the whole app if one model fails
+                import sys
+                print(f"Warning: Failed to register entity {cls.table} with Rust: {e}", file=sys.stderr)
 
     @classmethod
     def _get_hooks(cls):
@@ -56,14 +48,43 @@ class BaseModel:
     @classmethod
     def get_field_definitions(cls) -> Dict[str, str]:
         # Extract field types using Python type hints for the migration engine
+        import uuid
+        from datetime import datetime
+        
         hints = get_type_hints(cls)
         defs = {}
         # Filter hints to only include fields in _fields
         for field in cls._fields:
             type_obj = hints.get(field, Any)
-            # Simple string representation of type for the snapshot
-            type_name = getattr(type_obj, "__name__", str(type_obj))
-            if "Optional" in str(type_obj):
+            
+            # Extract the inner type if it's Optional[...]
+            origin = getattr(type_obj, "__origin__", None)
+            is_optional = False
+            if origin is Union:
+                args = getattr(type_obj, "__args__", ())
+                if type(None) in args:
+                    is_optional = True
+                    type_obj = [a for a in args if a is not type(None)][0]
+            
+            # Map Python types to canonical names for Rust
+            if type_obj is str:
+                type_name = "str"
+            elif type_obj is int:
+                type_name = "int"
+            elif type_obj is float:
+                type_name = "float"
+            elif type_obj is bool:
+                type_name = "bool"
+            elif type_obj is uuid.UUID:
+                type_name = "uuid"
+            elif type_obj is datetime:
+                type_name = "datetime"
+            elif type_obj is dict or type_obj is list:
+                type_name = "json"
+            else:
+                type_name = getattr(type_obj, "__name__", str(type_obj)).lower()
+
+            if is_optional:
                 type_name = f"Optional[{type_name}]"
             defs[field] = type_name
         return defs
@@ -71,18 +92,6 @@ class BaseModel:
     @classmethod
     def query(cls) -> QueryBuilder:
         return QueryBuilder(cls)
-
-    @classmethod
-    def _get_identity_cache(cls) -> Dict[tuple, Any]:
-        # Retrieve the identity map for the current task context
-        import asyncio
-
-        current_task = asyncio.current_task()
-        if current_task is None:
-            return {}
-        if not hasattr(current_task, "_bridge_orm_identity_map"):
-            setattr(current_task, "_bridge_orm_identity_map", {})
-        return getattr(current_task, "_bridge_orm_identity_map")
 
     @classmethod
     async def create(cls, tx=None, **kwargs) -> Any:
@@ -96,35 +105,36 @@ class BaseModel:
 
         await dispatch_hooks(cls, "before_create", instance)
 
-        # Convert kwargs to string map for generic Rust interface
-        data = {k: str(v) for k, v in kwargs.items()}
+        # Keep original types for generic Rust interface
+        data = {k: v for k, v in kwargs.items()}
 
         # Add default values if missing
         if "id" in cls._primary_keys and "id" not in data:
             import uuid
-
-            data["id"] = str(uuid.uuid4())
+            data["id"] = uuid.uuid4()
 
         if "created_at" in cls._fields and "created_at" not in data:
-            from datetime import datetime
-
-            data["created_at"] = datetime.now().isoformat()
+            from datetime import datetime, timezone
+            data["created_at"] = datetime.now(timezone.utc)
 
         if "updated_at" in cls._fields and "updated_at" not in data:
-            from datetime import datetime
+            from datetime import datetime, timezone
+            data["updated_at"] = datetime.now(timezone.utc)
 
-            data["updated_at"] = datetime.now().isoformat()
-
-        # Call generic Rust insert
-        raw_res = await bridge_orm_rs.insert_row(cls.table, data, tx=tx)
+        # Call generic Rust insert. Note: tx can be Session or TxHandle.
+        # If it's a Session, the Rust FFI extracts its inner transaction.
+        rs_tx = tx._rs_session if hasattr(tx, "_rs_session") else tx
+        raw_res = await bridge_orm_rs.insert_row(cls.table, data, tx=rs_tx)
 
         # Map back to model instance
         res = cls(**raw_res)
+        if hasattr(tx, "set_entity"):
+            res._session = tx
 
-        # Populate Identity Map
-        cache = cls._get_identity_cache()
-        pk_values = {k: getattr(res, k) for k in cls._primary_keys}
-        cache[cls._build_cache_key(**pk_values)] = res
+        # Populate Identity Map if in a session
+        if hasattr(tx, "set_entity"):
+            pk_values = tuple(getattr(res, k) for k in cls._primary_keys)
+            tx.set_entity(cls, pk_values, res)
 
         await dispatch_hooks(cls, "after_create", res)
         return res
@@ -138,34 +148,33 @@ class BaseModel:
             # Prep data with defaults for each item in chunk
             prepared_chunk = []
             for item in chunk:
-                data = {k: str(v) for k, v in item.items()}
+                data = {k: v for k, v in item.items()}
                 if "id" in cls._primary_keys and "id" not in data:
                     import uuid
-
-                    data["id"] = str(uuid.uuid4())
+                    data["id"] = uuid.uuid4()
 
                 if "created_at" in cls._fields and "created_at" not in data:
-                    from datetime import datetime
-
-                    data["created_at"] = datetime.now().isoformat()
+                    from datetime import datetime, timezone
+                    data["created_at"] = datetime.now(timezone.utc)
 
                 if "updated_at" in cls._fields and "updated_at" not in data:
-                    from datetime import datetime
-
-                    data["updated_at"] = datetime.now().isoformat()
+                    from datetime import datetime, timezone
+                    data["updated_at"] = datetime.now(timezone.utc)
                 prepared_chunk.append(data)
 
             # Single FFI crossiing for the entire chunk
+            rs_tx = tx._rs_session if hasattr(tx, "_rs_session") else tx
             raw_results = await bridge_orm_rs.insert_rows_bulk(
-                cls.table, prepared_chunk, tx=tx
+                cls.table, prepared_chunk, tx=rs_tx
             )
 
             # Map back to model instances and populate Identity Map
-            cache = cls._get_identity_cache()
             for raw_res in raw_results:
                 instance = cls(**raw_res)
-                pk_values = {k: getattr(instance, k) for k in cls._primary_keys}
-                cache[cls._build_cache_key(**pk_values)] = instance
+                if hasattr(tx, "set_entity"):
+                    instance._session = tx
+                    pk_values = tuple(getattr(instance, k) for k in cls._primary_keys)
+                    tx.set_entity(cls, pk_values, instance)
                 results.append(instance)
 
         return results
@@ -174,7 +183,7 @@ class BaseModel:
     async def find_one(
         cls, tx=None, fields: Optional[List[str]] = None, **kwargs
     ) -> Optional[Any]:
-        #  Check Identity Map first if all primary keys provided
+        #  Check Identity Map first if all primary keys provided and we have a session
         pk_provided = all(k in kwargs for k in cls._primary_keys)
 
         # Enforcement: If it's a composite key, don't allow 'id' unless it's actually a PK
@@ -197,34 +206,39 @@ class BaseModel:
                 f"Missing: {[k for k in cls._primary_keys if k not in kwargs]}"
             )
 
-        if pk_provided and fields is None:
-            cache = cls._get_identity_cache()
-            cache_key = cls._build_cache_key(**kwargs)
-            if cache_key in cache:
-                return cache[cache_key]
+        if pk_provided and fields is None and hasattr(tx, "get_entity"):
+            pk_values = tuple(kwargs[k] for k in cls._primary_keys)
+            cached = tx.get_entity(cls.table, pk_values)
+            if cached:
+                return cached
 
-        # Convert filters to string map
-        filters = {k: str(v) for k, v in kwargs.items()}
-
+        # Fetch from DB if not in cache or partial select requested
+        filters = kwargs
         raw_res = await bridge_orm_rs.find_one(cls.table, filters, fields=fields)
+
         if raw_res is None:
-            raise NotFoundError(f"No {cls.__name__} found matching {kwargs}")
+            return None
 
         res = cls(**raw_res)
+        if hasattr(tx, "set_entity"):
+            res._session = tx
         if fields:
             res._projected_fields = fields
 
-        # Add to cache on miss (only if full model)
-        if fields is None:
-            cache = cls._get_identity_cache()
-            pk_values = {k: getattr(res, k) for k in cls._primary_keys}
-            cache[cls._build_cache_key(**pk_values)] = res
-
+        # Populate cache if it was a full PK fetch and we have a session
+        if pk_provided and fields is None and hasattr(tx, "set_entity"):
+            pk_values = tuple(getattr(res, k) for k in cls._primary_keys)
+            tx.set_entity(cls, pk_values, res)
         return res
 
     def __init__(self, **kwargs):
+        self._session = None
         for k, v in kwargs.items():
             setattr(self, k, v)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert the model instance to a dictionary of its fields."""
+        return {field: getattr(self, field) for field in self._fields if hasattr(self, field)}
 
     def __getattr__(self, name: str) -> Any:
         if self._projected_fields is not None and name in self._fields:
