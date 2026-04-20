@@ -8,7 +8,7 @@ name = "bridge_orm_rs"
 crate-type = ["cdylib"]
 
 [dependencies]
-pyo3       = { version = "0.21", features = ["extension-module"] }
+pyo3       = { version = "0.21", features = ["extension-module", "uuid", "chrono"] }
 pyo3-async-runtimes = { version = "0.21", features = ["tokio-runtime"] }
 sqlx       = { version = "0.7",  features = [
                  "runtime-tokio-rustls", "postgres", "sqlite", "mysql",

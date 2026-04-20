@@ -1,4 +1,4 @@
-use crate::error::{BridgeOrmError, BridgeOrmResult};
+use crate::error::{BridgeOrmError, BridgeOrmResult, DiagnosticInfo};
 use crate::telemetry::logger::{self, TelemetryEvent};
 use futures::stream::BoxStream;
 use futures::StreamExt;
@@ -6,7 +6,10 @@ use once_cell::sync::Lazy;
 use regex::Regex;
 use sqlx::{any::AnyRow, AnyPool, Column, Row};
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Instant;
+use tokio::sync::Mutex;
+use crate::engine::query::QueryValue;
 
 /// Constants for SQL validation and formatting.
 const VALID_IDENTIFIER_REGEX: &str = r"^[a-zA-Z_][a-zA-Z0-9_]*$";
@@ -17,13 +20,6 @@ const RESERVED_KEYWORDS: [&str; 8] = [
 pub static VALID_SQL_IDENTIFIER_PATTERN: Lazy<Regex> =
     Lazy::new(|| Regex::new(VALID_IDENTIFIER_REGEX).expect("Invalid hardcoded regex pattern"));
 
-/// Represents a parameterized SQL statement.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub struct SqlStatement {
-    pub sql: String,
-    pub params: Vec<String>,
-}
-
 /// Represents supported SQL dialects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -32,6 +28,71 @@ pub enum SqlDialect {
     Sqlite,
     MySql,
     MsSql,
+}
+
+pub trait Dialect: Send + Sync {
+    fn get_placeholder(&self, index: usize) -> String;
+    fn quote_identifier(&self, identifier: &str) -> String {
+        format!("\"{}\"", identifier)
+    }
+    fn build_select(&self, table: &str, columns: &[String], filters: &[(String, QueryValue)], limit: Option<i64>) -> (String, Vec<QueryValue>) {
+        let cols = if columns.is_empty() { "*".to_string() } else { columns.join(", ") };
+        let mut sql = format!("SELECT {} FROM {}", cols, table);
+        let mut values = Vec::new();
+        
+        if !filters.is_empty() {
+            sql.push_str(" WHERE ");
+            let mut conditions = Vec::new();
+            for (col, val) in filters {
+                match val {
+                    QueryValue::Raw(raw) => {
+                        let mut sql_fragment = raw.sql.clone();
+                        for p in &raw.params {
+                            let placeholder = self.get_placeholder(values.len());
+                            sql_fragment = sql_fragment.replacen("{}", &placeholder, 1);
+                            values.push(p.clone());
+                        }
+                        conditions.push(format!("{} {}", col, sql_fragment));
+                    }
+                    _ => {
+                        conditions.push(format!("{} = {}", col, self.get_placeholder(values.len())));
+                        values.push(val.clone());
+                    }
+                }
+            }
+            sql.push_str(&conditions.join(" AND "));
+        }
+        
+        if let Some(l) = limit {
+            sql.push_str(&format!(" LIMIT {}", l));
+        }
+        
+        (sql, values)
+    }
+}
+
+pub struct SqliteDialect;
+impl Dialect for SqliteDialect {
+    fn get_placeholder(&self, index: usize) -> String {
+        format!("${}", index + 1)
+    }
+}
+
+pub struct PostgreSqlDialect;
+impl Dialect for PostgreSqlDialect {
+    fn get_placeholder(&self, index: usize) -> String {
+        format!("${}", index + 1)
+    }
+}
+
+pub struct MySqlDialect;
+impl Dialect for MySqlDialect {
+    fn get_placeholder(&self, index: usize) -> String {
+        "?".to_string()
+    }
+    fn quote_identifier(&self, identifier: &str) -> String {
+        format!("`{}`", identifier)
+    }
 }
 
 impl SqlDialect {
@@ -51,13 +112,12 @@ impl SqlDialect {
         }
     }
 
-    /// Returns the appropriate placeholder for the current dialect.
-    #[must_use]
-    pub fn get_placeholder(&self, index: usize) -> String {
+    pub fn to_dialect(&self) -> Box<dyn Dialect> {
         match self {
-            Self::Postgres | Self::Sqlite => format!("${}", index + 1),
-            Self::MySql => "?".to_string(),
-            Self::MsSql => format!("@p{}", index + 1),
+            Self::Postgres => Box::new(PostgreSqlDialect),
+            Self::Sqlite => Box::new(SqliteDialect),
+            Self::MySql => Box::new(MySqlDialect),
+            Self::MsSql => Box::new(SqliteDialect), // Fallback for now
         }
     }
 }
@@ -66,17 +126,17 @@ impl SqlDialect {
 #[must_use]
 pub fn validate_identifier(identifier: &str) -> BridgeOrmResult<()> {
     if !VALID_SQL_IDENTIFIER_PATTERN.is_match(identifier) {
-        return Err(BridgeOrmError::Validation(format!(
-            "Security Violation: Invalid SQL identifier '{}'",
-            identifier
-        )));
+        return Err(BridgeOrmError::Validation(
+            format!("Security Violation: Invalid SQL identifier '{}'", identifier),
+            DiagnosticInfo::default(),
+        ));
     }
 
     if RESERVED_KEYWORDS.contains(&identifier.to_uppercase().as_str()) {
-        return Err(BridgeOrmError::Validation(format!(
-            "Security Violation: Reserved keyword '{}' used as identifier",
-            identifier
-        )));
+        return Err(BridgeOrmError::Validation(
+            format!("Security Violation: Reserved keyword '{}' used as identifier", identifier),
+            DiagnosticInfo::default(),
+        ));
     }
     Ok(())
 }
@@ -92,9 +152,9 @@ pub async fn connect(url: &str) -> BridgeOrmResult<AnyPool> {
 /// Shared logic for building placeholders and values for queries.
 #[must_use]
 fn prepare_statement(
-    dialect: SqlDialect,
-    data: &HashMap<String, String>,
-) -> BridgeOrmResult<(Vec<String>, Vec<String>, Vec<String>)> {
+    dialect: &dyn Dialect,
+    data: &HashMap<String, QueryValue>,
+) -> BridgeOrmResult<(Vec<String>, Vec<QueryValue>, Vec<String>)> {
     let mut columns = Vec::new();
     let mut values = Vec::new();
     let mut placeholders = Vec::new();
@@ -108,36 +168,155 @@ fn prepare_statement(
     Ok((columns, values, placeholders))
 }
 
-/// Helper to convert a database row into a HashMap.
-#[must_use]
-pub fn row_to_map(row: &AnyRow) -> HashMap<String, String> {
-    let mut map = HashMap::new();
-    for column in row.columns() {
-        let name = column.name();
-        let val: String = row.try_get(name).unwrap_or_default();
-        map.insert(name.to_string(), val);
+/// Helper to bind QueryValue to a query.
+fn bind_query_value<'q>(
+    query: sqlx::query::Query<'q, sqlx::Any, sqlx::any::AnyArguments<'q>>,
+    value: &'q QueryValue,
+) -> sqlx::query::Query<'q, sqlx::Any, sqlx::any::AnyArguments<'q>> {
+    match value {
+        QueryValue::String(s) => query.bind(s),
+        QueryValue::Int(i) => query.bind(i),
+        QueryValue::Float(f) => query.bind(f),
+        QueryValue::Bool(b) => query.bind(b),
+        QueryValue::Uuid(u) => query.bind(u),
+        QueryValue::DateTime(dt) => query.bind(dt),
+        QueryValue::Json(j) => query.bind(j),
+        QueryValue::Bytes(b) => query.bind(b),
+        QueryValue::Raw(_) => panic!("RawExpression should have been expanded before binding"),
+        QueryValue::Null => query.bind(None::<String>),
     }
-    map
+}
+
+/// Pure Rust generic update.
+#[must_use]
+#[tracing::instrument(skip(pool, tx))]
+pub async fn generic_update(
+    pool: &AnyPool,
+    tx: Option<&Arc<Mutex<Option<sqlx::Transaction<'static, sqlx::Any>>>>>,
+    url: &str,
+    table_name: &str,
+    data: HashMap<String, QueryValue>,
+    filters: HashMap<String, QueryValue>,
+) -> BridgeOrmResult<()> {
+    validate_identifier(table_name)?;
+    let dialect_type = SqlDialect::from_url(url);
+    let dialect = dialect_type.to_dialect();
+
+    if data.is_empty() {
+        return Ok(());
+    }
+
+    let mut sql = format!("UPDATE {} SET ", table_name);
+    let mut values = Vec::new();
+    let mut set_clauses = Vec::new();
+
+    for (col, val) in data {
+        validate_identifier(&col)?;
+        match val {
+            QueryValue::Raw(raw) => {
+                let mut sql_fragment = raw.sql.clone();
+                for p in raw.params {
+                    let placeholder = dialect.get_placeholder(values.len());
+                    sql_fragment = sql_fragment.replacen("{}", &placeholder, 1);
+                    values.push(p);
+                }
+                set_clauses.push(format!("{} = {}", col, sql_fragment));
+            }
+            _ => {
+                set_clauses.push(format!("{} = {}", col, dialect.get_placeholder(values.len())));
+                values.push(val);
+            }
+        }
+    }
+    sql.push_str(&set_clauses.join(", "));
+
+    if !filters.is_empty() {
+        sql.push_str(" WHERE ");
+        let mut where_clauses = Vec::new();
+        for (col, val) in filters {
+            validate_identifier(&col)?;
+            match val {
+                QueryValue::Raw(raw) => {
+                    let mut sql_fragment = raw.sql.clone();
+                    for p in raw.params {
+                        let placeholder = dialect.get_placeholder(values.len());
+                        sql_fragment = sql_fragment.replacen("{}", &placeholder, 1);
+                        values.push(p);
+                    }
+                    where_clauses.push(format!("{} {}", col, sql_fragment));
+                }
+                _ => {
+                    where_clauses.push(format!("{} = {}", col, dialect.get_placeholder(values.len())));
+                    values.push(val);
+                }
+            }
+        }
+        sql.push_str(&where_clauses.join(" AND "));
+    }
+
+    let mut query = sqlx::query(&sql);
+    for val in &values {
+        query = bind_query_value(query, val);
+    }
+
+    if let Some(tx_mutex) = tx {
+        let mut tx_guard = tx_mutex.lock().await;
+        let tx_conn = tx_guard
+            .as_mut()
+            .ok_or_else(|| BridgeOrmError::Validation("Transaction already closed".to_string(), DiagnosticInfo::default()))?;
+        query.execute(&mut **tx_conn).await.map_err(|e| BridgeOrmError::from(e).with_sql(sql.clone(), None).add_breadcrumb("generic_update"))?;
+    } else {
+        query.execute(pool).await.map_err(|e| BridgeOrmError::from(e).with_sql(sql.clone(), None).add_breadcrumb("generic_update"))?;
+    }
+
+    Ok(())
 }
 
 /// Pure Rust implementation of execute_raw.
 #[must_use]
+#[tracing::instrument(skip(pool))]
 pub async fn execute_raw(pool: &AnyPool, sql: &str) -> BridgeOrmResult<()> {
-    sqlx::query(sql).execute(pool).await?;
+    sqlx::query(sql).execute(pool).await.map_err(|e| BridgeOrmError::from(e).with_sql(sql.to_string(), None).add_breadcrumb("execute_raw"))?;
     Ok(())
 }
 
 /// Pure Rust generic insert.
 #[must_use]
+#[tracing::instrument(skip(pool, tx))]
 pub async fn generic_insert(
     pool: &AnyPool,
+    tx: Option<&Arc<Mutex<Option<sqlx::Transaction<'static, sqlx::Any>>>>>,
     url: &str,
     table_name: &str,
-    data: HashMap<String, String>,
-) -> BridgeOrmResult<HashMap<String, String>> {
+    data: HashMap<String, QueryValue>,
+) -> BridgeOrmResult<HashMap<String, QueryValue>> {
     validate_identifier(table_name)?;
-    let dialect = SqlDialect::from_url(url);
-    let (columns, values, placeholders) = prepare_statement(dialect, &data)?;
+    let dialect_type = SqlDialect::from_url(url);
+    let dialect = dialect_type.to_dialect();
+    
+    let mut columns = Vec::new();
+    let mut values = Vec::new();
+    let mut placeholders = Vec::new();
+
+    for (col, val) in data {
+        validate_identifier(&col)?;
+        columns.push(col);
+        match val {
+            QueryValue::Raw(raw) => {
+                let mut sql_fragment = raw.sql.clone();
+                for p in raw.params {
+                    let placeholder = dialect.get_placeholder(values.len());
+                    sql_fragment = sql_fragment.replacen("{}", &placeholder, 1);
+                    values.push(p);
+                }
+                placeholders.push(sql_fragment);
+            }
+            _ => {
+                placeholders.push(dialect.get_placeholder(values.len()));
+                values.push(val);
+            }
+        }
+    }
 
     let sql = format!(
         "INSERT INTO {} ({}) VALUES ({})",
@@ -149,10 +328,18 @@ pub async fn generic_insert(
     let start = Instant::now();
     let mut query = sqlx::query(&sql);
     for val in &values {
-        query = query.bind(val);
+        query = bind_query_value(query, val);
     }
 
-    query.execute(pool).await?;
+    if let Some(tx_mutex) = tx {
+        let mut tx_guard = tx_mutex.lock().await;
+        let tx_conn = tx_guard
+            .as_mut()
+            .ok_or_else(|| BridgeOrmError::Validation("Transaction already closed".to_string(), DiagnosticInfo::default()))?;
+        query.execute(&mut **tx_conn).await.map_err(|e| BridgeOrmError::from(e).with_sql(sql.clone(), None).add_breadcrumb("generic_insert"))?;
+    } else {
+        query.execute(pool).await.map_err(|e| BridgeOrmError::from(e).with_sql(sql.clone(), None).add_breadcrumb("generic_insert"))?;
+    }
 
     let duration = start.elapsed();
     logger::emit_telemetry(TelemetryEvent {
@@ -167,14 +354,17 @@ pub async fn generic_insert(
 
 /// Pure Rust generic bulk insert.
 #[must_use]
+#[tracing::instrument(skip(pool, tx))]
 pub async fn generic_insert_bulk(
     pool: &AnyPool,
+    tx: Option<&Arc<Mutex<Option<sqlx::Transaction<'static, sqlx::Any>>>>>,
     url: &str,
     table_name: &str,
-    items: Vec<HashMap<String, String>>,
-) -> BridgeOrmResult<Vec<HashMap<String, String>>> {
+    items: Vec<HashMap<String, QueryValue>>,
+) -> BridgeOrmResult<Vec<HashMap<String, QueryValue>>> {
     validate_identifier(table_name)?;
-    let dialect = SqlDialect::from_url(url);
+    let dialect_type = SqlDialect::from_url(url);
+    let dialect = dialect_type.to_dialect();
 
     if items.is_empty() {
         return Ok(Vec::new());
@@ -182,7 +372,7 @@ pub async fn generic_insert_bulk(
 
     // Assume all items have the same keys as the first item for bulk construction
     let first_item = &items[0];
-    let (columns, _, _) = prepare_statement(dialect, first_item)?;
+    let (columns, _, _) = prepare_statement(dialect.as_ref(), first_item)?;
 
     let mut sql = format!(
         "INSERT INTO {} ({}) VALUES ",
@@ -193,12 +383,25 @@ pub async fn generic_insert_bulk(
     let mut placeholders = Vec::new();
     let mut all_values = Vec::new();
 
-    for (row_idx, item) in items.iter().enumerate() {
+    for item in items.iter() {
         let mut row_placeholders = Vec::new();
-        for (col_idx, col) in columns.iter().enumerate() {
-            let val = item.get(col).cloned().unwrap_or_default();
-            all_values.push(val);
-            row_placeholders.push(dialect.get_placeholder(row_idx * columns.len() + col_idx));
+        for col in &columns {
+            let val = item.get(col).cloned().unwrap_or(QueryValue::Null);
+            match val {
+                QueryValue::Raw(raw) => {
+                    let mut sql_fragment = raw.sql.clone();
+                    for p in raw.params {
+                        let placeholder = dialect.get_placeholder(all_values.len());
+                        sql_fragment = sql_fragment.replacen("{}", &placeholder, 1);
+                        all_values.push(p);
+                    }
+                    row_placeholders.push(sql_fragment);
+                }
+                _ => {
+                    row_placeholders.push(dialect.get_placeholder(all_values.len()));
+                    all_values.push(val);
+                }
+            }
         }
         placeholders.push(format!("({})", row_placeholders.join(", ")));
     }
@@ -208,10 +411,26 @@ pub async fn generic_insert_bulk(
     let start = Instant::now();
     let mut query = sqlx::query(&sql);
     for val in &all_values {
-        query = query.bind(val);
+        query = bind_query_value(query, val);
     }
 
-    query.execute(pool).await?;
+    if let Some(tx_mutex) = tx {
+        let mut tx_guard = tx_mutex.lock().await;
+        let tx_conn = tx_guard
+            .as_mut()
+            .ok_or_else(|| {
+                BridgeOrmError::Validation("Transaction already closed".to_string(), DiagnosticInfo::default())
+            })?;
+        query
+            .execute(&mut **tx_conn)
+            .await
+            .map_err(|e| BridgeOrmError::from(e).with_sql(sql.clone(), None).add_breadcrumb("generic_insert_bulk"))?;
+    } else {
+        query
+            .execute(pool)
+            .await
+            .map_err(|e| BridgeOrmError::from(e).with_sql(sql.clone(), None).add_breadcrumb("generic_insert_bulk"))?;
+    }
 
     let duration = start.elapsed();
     logger::emit_telemetry(TelemetryEvent {
@@ -226,51 +445,55 @@ pub async fn generic_insert_bulk(
 
 /// Pure Rust generic query.
 #[must_use]
+#[tracing::instrument(skip(pool, tx))]
 pub async fn generic_query(
     pool: &AnyPool,
+    tx: Option<&Arc<Mutex<Option<sqlx::Transaction<'static, sqlx::Any>>>>>,
     url: &str,
     table_name: &str,
-    filters: HashMap<String, String>,
+    filters: HashMap<String, QueryValue>,
     limit: Option<i64>,
     fields: Option<Vec<String>>,
-) -> BridgeOrmResult<Vec<HashMap<String, String>>> {
+) -> BridgeOrmResult<Vec<AnyRow>> {
     validate_identifier(table_name)?;
-    let dialect = SqlDialect::from_url(url);
+    let dialect_type = SqlDialect::from_url(url);
+    let dialect = dialect_type.to_dialect();
 
-    let select_clause = if let Some(cols) = &fields {
-        for col in cols {
-            validate_identifier(col)?;
-        }
-        cols.join(", ")
-    } else {
-        "*".to_string()
-    };
-
-    let mut sql = format!("SELECT {} FROM {}", select_clause, table_name);
-    let mut values = Vec::new();
-
-    if !filters.is_empty() {
-        sql.push_str(" WHERE ");
-        let mut conditions = Vec::new();
-        for (idx, (col, val)) in filters.iter().enumerate() {
-            validate_identifier(col)?;
-            conditions.push(format!("{} = {}", col, dialect.get_placeholder(idx)));
-            values.push(val.clone());
-        }
-        sql.push_str(&conditions.join(" AND "));
+    let columns = fields.unwrap_or_default();
+    for col in &columns {
+        validate_identifier(col)?;
+    }
+    
+    let filter_vec: Vec<(String, QueryValue)> = filters.into_iter().collect();
+    for (col, _) in &filter_vec {
+        validate_identifier(col)?;
     }
 
-    if let Some(l) = limit {
-        sql.push_str(&format!(" LIMIT {}", l));
-    }
+    let (sql, values) = dialect.build_select(table_name, &columns, &filter_vec, limit);
 
     let start = Instant::now();
     let mut query = sqlx::query(&sql);
     for val in &values {
-        query = query.bind(val);
+        query = bind_query_value(query, val);
     }
 
-    let rows = query.fetch_all(pool).await?;
+    let rows = if let Some(tx_mutex) = tx {
+        let mut tx_guard = tx_mutex.lock().await;
+        let tx_conn = tx_guard
+            .as_mut()
+            .ok_or_else(|| {
+                BridgeOrmError::Validation("Transaction already closed".to_string(), DiagnosticInfo::default())
+            })?;
+        query
+            .fetch_all(&mut **tx_conn)
+            .await
+            .map_err(|e| BridgeOrmError::from(e).with_sql(sql.clone(), None).add_breadcrumb("generic_query"))?
+    } else {
+        query
+            .fetch_all(pool)
+            .await
+            .map_err(|e| BridgeOrmError::from(e).with_sql(sql.clone(), None).add_breadcrumb("generic_query"))?
+    };
 
     let duration = start.elapsed();
     logger::emit_telemetry(TelemetryEvent {
@@ -280,56 +503,54 @@ pub async fn generic_query(
         table: table_name.to_string(),
     });
 
-    Ok(rows.iter().map(row_to_map).collect())
+    Ok(rows)
 }
 
 /// Pure Rust implementation of lazy query.
 #[must_use]
+#[tracing::instrument(skip(pool, tx))]
 pub fn query_lazy(
     pool: &AnyPool,
+    tx: Option<Arc<Mutex<Option<sqlx::Transaction<'static, sqlx::Any>>>>>,
     url: &str,
     table_name: &str,
-    filters: HashMap<String, String>,
+    filters: HashMap<String, QueryValue>,
     limit: Option<i64>,
     fields: Option<Vec<String>>,
-) -> BridgeOrmResult<BoxStream<'static, Result<AnyRow, sqlx::Error>>> {
+) -> BridgeOrmResult<BoxStream<'static, BridgeOrmResult<AnyRow>>> {
     validate_identifier(table_name)?;
-    let dialect = SqlDialect::from_url(url);
+    let dialect_type = SqlDialect::from_url(url);
+    let dialect = dialect_type.to_dialect();
 
-    let select_clause = if let Some(cols) = &fields {
-        for col in cols {
-            validate_identifier(col)?;
-        }
-        cols.join(", ")
-    } else {
-        "*".to_string()
-    };
-
-    let mut sql = format!("SELECT {} FROM {}", select_clause, table_name);
-    let mut values = Vec::new();
-
-    if !filters.is_empty() {
-        sql.push_str(" WHERE ");
-        let mut conditions = Vec::new();
-        for (idx, (col, val)) in filters.iter().enumerate() {
-            validate_identifier(col)?;
-            conditions.push(format!("{} = {}", col, dialect.get_placeholder(idx)));
-            values.push(val.clone());
-        }
-        sql.push_str(&conditions.join(" AND "));
-    }
-
-    if let Some(l) = limit {
-        sql.push_str(&format!(" LIMIT {}", l));
-    }
+    let columns = fields.unwrap_or_default();
+    let filter_vec: Vec<(String, QueryValue)> = filters.into_iter().collect();
+    
+    let (sql, values) = dialect.build_select(table_name, &columns, &filter_vec, limit);
 
     let pool_clone = pool.clone();
     let stream = futures::stream::once(async move {
         let mut query = sqlx::query(&sql);
-        for val in values {
-            query = query.bind(val);
+        for val in &values {
+            query = bind_query_value(query, val);
         }
-        query.fetch_all(&pool_clone).await
+
+        if let Some(tx_mutex) = tx {
+            let mut tx_guard = tx_mutex.lock().await;
+            let tx_conn = tx_guard
+                .as_mut()
+                .ok_or_else(|| {
+                    BridgeOrmError::Validation("Transaction already closed".to_string(), DiagnosticInfo::default())
+                })?; 
+            query
+                .fetch_all(&mut **tx_conn)
+                .await
+                .map_err(|e| BridgeOrmError::from(e).with_sql(sql.clone(), None).add_breadcrumb("query_lazy"))
+        } else {
+            query
+                .fetch_all(&pool_clone)
+                .await
+                .map_err(|e| BridgeOrmError::from(e).with_sql(sql.clone(), None).add_breadcrumb("query_lazy"))
+        }
     })
     .flat_map(|res| match res {
         Ok(rows) => futures::stream::iter(rows.into_iter().map(Ok)).left_stream(),
@@ -381,10 +602,10 @@ pub fn resolve_python_type_to_sql(py_type: &str, dialect: &str) -> BridgeOrmResu
         }
         (t, _) if t.contains("Enum") => "TEXT".to_string(),
         (unknown, _) => {
-            return Err(BridgeOrmError::Validation(format!(
-                "Unsupported Python type '{}'",
-                unknown
-            )))
+            return Err(BridgeOrmError::Validation(
+                format!("Unsupported Python type '{}'", unknown),
+                DiagnosticInfo::default(),
+            ))
         }
     };
 

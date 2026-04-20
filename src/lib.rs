@@ -1,7 +1,6 @@
 mod engine;
 mod error;
 mod ffi;
-mod java_api;
 mod schema;
 mod telemetry;
 

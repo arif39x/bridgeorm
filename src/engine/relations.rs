@@ -1,23 +1,13 @@
-use sqlx::{AnyPool, Row, any::AnyRow};
-use crate::error::BridgeOrmResult;
-use crate::engine::db::validate_identifier;
-
-pub enum RelationKind {
-    OneToMany {
-        foreign_key: String,
-    },
-    ManyToMany {
-        junction_table: String,
-        left_key: String,
-        right_key: String,
-    },
-    SelfRef {
-        parent_key: String,
-    },
-}
+use sqlx::{AnyPool, any::AnyRow};
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use crate::error::{BridgeOrmError, BridgeOrmResult};
+use crate::engine::db::{validate_identifier, SqlDialect};
 
 pub async fn fetch_one_to_many(
     pool: &AnyPool,
+    tx: Option<&Arc<Mutex<Option<sqlx::Transaction<'static, sqlx::Any>>>>>,
+    url: &str,
     child_table: &str,
     foreign_key: &str,
     parent_id: &str,
@@ -25,21 +15,31 @@ pub async fn fetch_one_to_many(
     validate_identifier(child_table)?;
     validate_identifier(foreign_key)?;
     
+    let dialect = SqlDialect::from_url(url).to_dialect();
     let sql = format!(
-        "SELECT * FROM {} WHERE {} = $1",
-        child_table, foreign_key
+        "SELECT * FROM {} WHERE {} = {}",
+        child_table, foreign_key, dialect.get_placeholder(0)
     );
     
-    let rows = sqlx::query(&sql)
-        .bind(parent_id)
-        .fetch_all(pool)
-        .await?;
+    let mut query = sqlx::query(&sql).bind(parent_id);
+    
+    let rows = if let Some(tx_mutex) = tx {
+        let mut tx_guard = tx_mutex.lock().await;
+        let tx_conn = tx_guard
+            .as_mut()
+            .ok_or_else(|| BridgeOrmError::Validation("Transaction already closed".to_string(), DiagnosticInfo::default()))?;
+        query.fetch_all(&mut **tx_conn).await?
+    } else {
+        query.fetch_all(pool).await?
+    };
     
     Ok(rows)
 }
 
 pub async fn fetch_many_to_many(
     pool: &AnyPool,
+    tx: Option<&Arc<Mutex<Option<sqlx::Transaction<'static, sqlx::Any>>>>>,
+    url: &str,
     target_table: &str,
     junction_table: &str,
     left_key: &str,
@@ -51,23 +51,33 @@ pub async fn fetch_many_to_many(
     validate_identifier(left_key)?;
     validate_identifier(right_key)?;
 
+    let dialect = SqlDialect::from_url(url).to_dialect();
     let sql = format!(
         "SELECT t.* FROM {} t
          JOIN {} j ON t.id = j.{}
-         WHERE j.{} = $1",
-        target_table, junction_table, right_key, left_key
+         WHERE j.{} = {}",
+        target_table, junction_table, right_key, left_key, dialect.get_placeholder(0)
     );
 
-    let rows = sqlx::query(&sql)
-        .bind(parent_id)
-        .fetch_all(pool)
-        .await?;
+    let mut query = sqlx::query(&sql).bind(parent_id);
+
+    let rows = if let Some(tx_mutex) = tx {
+        let mut tx_guard = tx_mutex.lock().await;
+        let tx_conn = tx_guard
+            .as_mut()
+            .ok_or_else(|| BridgeOrmError::Validation("Transaction already closed".to_string(), DiagnosticInfo::default()))?;
+        query.fetch_all(&mut **tx_conn).await?
+    } else {
+        query.fetch_all(pool).await?
+    };
     
     Ok(rows)
 }
 
 pub async fn fetch_self_ref(
     pool: &AnyPool,
+    tx: Option<&Arc<Mutex<Option<sqlx::Transaction<'static, sqlx::Any>>>>>,
+    url: &str,
     table: &str,
     parent_key: &str,
     parent_id: &str,
@@ -75,15 +85,23 @@ pub async fn fetch_self_ref(
     validate_identifier(table)?;
     validate_identifier(parent_key)?;
 
+    let dialect = SqlDialect::from_url(url).to_dialect();
     let sql = format!(
-        "SELECT * FROM {} WHERE {} = $1",
-        table, parent_key
+        "SELECT * FROM {} WHERE {} = {}",
+        table, parent_key, dialect.get_placeholder(0)
     );
 
-    let rows = sqlx::query(&sql)
-        .bind(parent_id)
-        .fetch_all(pool)
-        .await?;
+    let mut query = sqlx::query(&sql).bind(parent_id);
+
+    let rows = if let Some(tx_mutex) = tx {
+        let mut tx_guard = tx_mutex.lock().await;
+        let tx_conn = tx_guard
+            .as_mut()
+            .ok_or_else(|| BridgeOrmError::Validation("Transaction already closed".to_string(), DiagnosticInfo::default()))?;
+        query.fetch_all(&mut **tx_conn).await?
+    } else {
+        query.fetch_all(pool).await?
+    };
     
     Ok(rows)
 }
