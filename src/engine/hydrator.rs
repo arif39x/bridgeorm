@@ -50,11 +50,10 @@ fn coerce_value(py: Python<'_>, row: &AnyRow, name: &str, meta: &ColumnMetadata)
             }
         }
         "uuid" => {
-            if let Ok(val) = row.try_get::<uuid::Uuid, _>(name) {
-                Ok(val.to_object(py))
-            } else if let Ok(val_str) = row.try_get::<String, _>(name) {
-                if let Ok(u) = uuid::Uuid::parse_str(&val_str) {
-                    Ok(u.to_object(py))
+            if let Ok(val_str) = row.try_get::<String, _>(name) {
+                let uuid_module = py.import_bound("uuid")?;
+                if let Ok(uuid_obj) = uuid_module.call_method1("UUID", (val_str.clone(),)) {
+                    Ok(uuid_obj.to_object(py))
                 } else {
                     Ok(val_str.to_object(py))
                 }
@@ -63,12 +62,11 @@ fn coerce_value(py: Python<'_>, row: &AnyRow, name: &str, meta: &ColumnMetadata)
             }
         }
         "datetime" | "timestamp" => {
-            if let Ok(val) = row.try_get::<chrono::DateTime<chrono::Utc>, _>(name) {
-                Ok(val.to_object(py))
-            } else if let Ok(val_str) = row.try_get::<String, _>(name) {
-                // SQLite/other might return string
-                if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&val_str) {
-                    Ok(dt.with_timezone(&chrono::Utc).to_object(py))
+            if let Ok(val_str) = row.try_get::<String, _>(name) {
+                let datetime_module = py.import_bound("datetime")?;
+                let datetime_cls = datetime_module.getattr("datetime")?;
+                if let Ok(dt_obj) = datetime_cls.call_method1("fromisoformat", (val_str.clone(),)) {
+                    Ok(dt_obj.to_object(py))
                 } else {
                     Ok(val_str.to_object(py))
                 }
@@ -112,10 +110,9 @@ fn coerce_value(py: Python<'_>, row: &AnyRow, name: &str, meta: &ColumnMetadata)
             }
         }
         "json" | "jsonb" => {
-            if let Ok(val) = row.try_get::<serde_json::Value, _>(name) {
-                let s = val.to_string();
+            if let Ok(val_str) = row.try_get::<String, _>(name) {
                 let json_module = py.import_bound("json").unwrap();
-                Ok(json_module.call_method1("loads", (s,)).unwrap().to_object(py))
+                Ok(json_module.call_method1("loads", (val_str,)).unwrap().to_object(py))
             } else {
                 Ok(py.None())
             }

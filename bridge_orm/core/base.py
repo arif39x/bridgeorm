@@ -22,8 +22,7 @@ class BaseModel:
         super().__init_subclass__(**kwargs)
         if cls.table:
             _MODEL_REGISTRY[cls.table] = cls
-            
-            # Register with Rust metadata engine for type-safe hydration
+
             try:
                 field_defs = cls.get_field_definitions()
                 columns = []
@@ -32,12 +31,15 @@ class BaseModel:
                     is_nullable = "Optional" in data_type
                     is_pk = field in cls._primary_keys
                     columns.append((field, data_type, is_nullable, is_pk))
-                
+
                 bridge_orm_rs.register_entity(cls.table, columns)
             except Exception as e:
-                # Log the error but don't crash the whole app if one model fails
                 import sys
-                print(f"Warning: Failed to register entity {cls.table} with Rust: {e}", file=sys.stderr)
+
+                print(
+                    f"Warning: Failed to register entity {cls.table} with Rust: {e}",
+                    file=sys.stderr,
+                )
 
     @classmethod
     def _get_hooks(cls):
@@ -50,13 +52,13 @@ class BaseModel:
         # Extract field types using Python type hints for the migration engine
         import uuid
         from datetime import datetime
-        
+
         hints = get_type_hints(cls)
         defs = {}
         # Filter hints to only include fields in _fields
         for field in cls._fields:
             type_obj = hints.get(field, Any)
-            
+
             # Extract the inner type if it's Optional[...]
             origin = getattr(type_obj, "__origin__", None)
             is_optional = False
@@ -65,7 +67,7 @@ class BaseModel:
                 if type(None) in args:
                     is_optional = True
                     type_obj = [a for a in args if a is not type(None)][0]
-            
+
             # Map Python types to canonical names for Rust
             if type_obj is str:
                 type_name = "str"
@@ -111,14 +113,17 @@ class BaseModel:
         # Add default values if missing
         if "id" in cls._primary_keys and "id" not in data:
             import uuid
+
             data["id"] = uuid.uuid4()
 
         if "created_at" in cls._fields and "created_at" not in data:
             from datetime import datetime, timezone
+
             data["created_at"] = datetime.now(timezone.utc)
 
         if "updated_at" in cls._fields and "updated_at" not in data:
             from datetime import datetime, timezone
+
             data["updated_at"] = datetime.now(timezone.utc)
 
         # Call generic Rust insert. Note: tx can be Session or TxHandle.
@@ -151,14 +156,17 @@ class BaseModel:
                 data = {k: v for k, v in item.items()}
                 if "id" in cls._primary_keys and "id" not in data:
                     import uuid
+
                     data["id"] = uuid.uuid4()
 
                 if "created_at" in cls._fields and "created_at" not in data:
                     from datetime import datetime, timezone
+
                     data["created_at"] = datetime.now(timezone.utc)
 
                 if "updated_at" in cls._fields and "updated_at" not in data:
                     from datetime import datetime, timezone
+
                     data["updated_at"] = datetime.now(timezone.utc)
                 prepared_chunk.append(data)
 
@@ -238,7 +246,11 @@ class BaseModel:
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert the model instance to a dictionary of its fields."""
-        return {field: getattr(self, field) for field in self._fields if hasattr(self, field)}
+        return {
+            field: getattr(self, field)
+            for field in self._fields
+            if hasattr(self, field)
+        }
 
     def __getattr__(self, name: str) -> Any:
         if self._projected_fields is not None and name in self._fields:

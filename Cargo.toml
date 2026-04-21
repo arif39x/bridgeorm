@@ -4,11 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "bridge_orm_rs"
-crate-type = ["cdylib"]
+name = "bridge_orm"
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-pyo3       = { version = "0.21", features = ["extension-module", "uuid", "chrono"] }
+pyo3       = { version = "0.21", features = ["extension-module"] }
 pyo3-async-runtimes = { version = "0.21", features = ["tokio-runtime"] }
 sqlx       = { version = "0.7",  features = [
                  "runtime-tokio-rustls", "postgres", "sqlite", "mysql",
@@ -26,3 +26,12 @@ tracing-subscriber = "0.3"
 regex = "1"
 jni = "0.21"
 thiserror = "1.0"
+arrow = "58"
+arrow-ipc = "58"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["async_tokio"] }
+
+[[bench]]
+name = "marshalling_bench"
+harness = false

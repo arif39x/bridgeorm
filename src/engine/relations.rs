@@ -1,7 +1,7 @@
 use sqlx::{AnyPool, any::AnyRow};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use crate::error::{BridgeOrmError, BridgeOrmResult};
+use crate::error::{BridgeOrmError, BridgeOrmResult, DiagnosticInfo};
 use crate::engine::db::{validate_identifier, SqlDialect};
 
 pub async fn fetch_one_to_many(

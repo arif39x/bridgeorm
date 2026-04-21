@@ -10,7 +10,7 @@ use pyo3::exceptions::{
     PyException, PyKeyError, PyRuntimeError, PyStopAsyncIteration, PyValueError,
 };
 use pyo3::prelude::*;
-use pyo3::types::PyDict;
+use pyo3::types::{PyDict, PyBytes};
 use sqlx::{any::AnyRow, AnyPool, Column, Row};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -41,8 +41,17 @@ fn query_value_to_py(py: Python<'_>, v: QueryValue) -> PyObject {
         QueryValue::Int(i) => i.to_object(py),
         QueryValue::Float(f) => f.to_object(py),
         QueryValue::Bool(b) => b.to_object(py),
-        QueryValue::Uuid(u) => u.to_object(py),
-        QueryValue::DateTime(dt) => dt.to_object(py),
+        QueryValue::Uuid(u) => {
+            let uuid_module = py.import_bound("uuid").unwrap();
+            let uuid_obj = uuid_module.call_method1("UUID", (u.to_string(),)).unwrap();
+            uuid_obj.to_object(py)
+        }
+        QueryValue::DateTime(dt) => {
+            let datetime_module = py.import_bound("datetime").unwrap();
+            let datetime_cls = datetime_module.getattr("datetime").unwrap();
+            let dt_obj = datetime_cls.call_method1("fromisoformat", (dt.to_rfc3339(),)).unwrap();
+            dt_obj.to_object(py)
+        }
         QueryValue::Json(j) => {
             let s = j.to_string();
             let json_module = py.import_bound("json").unwrap();
@@ -87,19 +96,27 @@ fn py_to_query_value(py: Python<'_>, obj: &Bound<'_, PyAny>, table_name: &str, c
                 }
             }
             "uuid" => {
-                if let Ok(u) = obj.extract::<uuid::Uuid>() {
-                    return QueryValue::Uuid(u);
-                }
-                // Fallback: try parsing from string
                 if let Ok(s) = obj.extract::<String>() {
                     if let Ok(u) = uuid::Uuid::parse_str(&s) {
                         return QueryValue::Uuid(u);
                     }
                 }
+                // If it's a UUID object, to_string() should work
+                if let Ok(u) = uuid::Uuid::parse_str(&obj.to_string()) {
+                    return QueryValue::Uuid(u);
+                }
             }
             "datetime" => {
-                if let Ok(dt) = obj.extract::<chrono::DateTime<chrono::Utc>>() {
-                    return QueryValue::DateTime(dt);
+                if let Ok(s) = obj.extract::<String>() {
+                    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&s) {
+                        return QueryValue::DateTime(dt.with_timezone(&chrono::Utc));
+                    }
+                }
+                // Try fromisoformat if it's a datetime object
+                if let Ok(s) = obj.call_method0("isoformat").and_then(|r| r.extract::<String>()) {
+                    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&s) {
+                        return QueryValue::DateTime(dt.with_timezone(&chrono::Utc));
+                    }
                 }
             }
             "json" | "jsonb" => {
@@ -132,12 +149,18 @@ fn py_to_query_value(py: Python<'_>, obj: &Bound<'_, PyAny>, table_name: &str, c
         return QueryValue::Float(f);
     }
 
-    if let Ok(u) = obj.extract::<uuid::Uuid>() {
-        return QueryValue::Uuid(u);
+    // Heuristics for UUID/DateTime if meta is missing
+    if let Ok(u) = uuid::Uuid::parse_str(&obj.to_string()) {
+        // Basic check to avoid false positives with random strings
+        if !obj.is_instance_of::<pyo3::types::PyString>() {
+             return QueryValue::Uuid(u);
+        }
     }
 
-    if let Ok(dt) = obj.extract::<chrono::DateTime<chrono::Utc>>() {
-        return QueryValue::DateTime(dt);
+    if let Ok(s) = obj.call_method0("isoformat").and_then(|r| r.extract::<String>()) {
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&s) {
+            return QueryValue::DateTime(dt.with_timezone(&chrono::Utc));
+        }
     }
 
     if let Ok(b) = obj.extract::<Vec<u8>>() {
@@ -321,12 +344,12 @@ fn reflect_table(py: Python<'_>, table_name: String) -> PyResult<Bound<'_, PyAny
 
 #[pyfunction]
 #[pyo3(signature = (table, data, tx=None))]
-fn insert_row(
-    py: Python<'_>,
+fn insert_row<'py>(
+    py: Python<'py>,
     table: String,
-    data: Bound<'_, PyDict>,
+    data: Bound<'py, PyDict>,
     tx: Option<PyObject>,
-) -> PyResult<Bound<'_, PyAny>> {
+) -> PyResult<Bound<'py, PyAny>> {
     let pool_guard = POOL.read().unwrap();
     let pool = pool_guard
         .as_ref()
@@ -382,13 +405,13 @@ fn insert_row(
 
 #[pyfunction]
 #[pyo3(signature = (table, filters, fields=None, tx=None))]
-fn find_one(
-    py: Python<'_>,
+fn find_one<'py>(
+    py: Python<'py>,
     table: String,
-    filters: Bound<'_, PyDict>,
+    filters: Bound<'py, PyDict>,
     fields: Option<Vec<String>>,
     tx: Option<PyObject>,
-) -> PyResult<Bound<'_, PyAny>> {
+) -> PyResult<Bound<'py, PyAny>> {
     let pool_guard = POOL.read().unwrap();
     let pool = pool_guard
         .as_ref()
@@ -435,7 +458,7 @@ fn find_one(
         .map_err(bridge_error_to_py)?;
 
         if rows.is_empty() {
-            Ok(None::<PyObject>.to_object(Python::with_gil(|py| py)))
+            Ok(Python::with_gil(|py| py.None()))
         } else {
             Python::with_gil(|py| {
                 let dict = engine::hydrator::hydrate_row(py, &table, &rows[0])?;
@@ -447,14 +470,76 @@ fn find_one(
 
 #[pyfunction]
 #[pyo3(signature = (table, filters, limit=None, fields=None, tx=None))]
-fn fetch_all(
-    py: Python<'_>,
+fn fetch_all_arrow<'py>(
+    py: Python<'py>,
     table: String,
-    filters: Bound<'_, PyDict>,
+    filters: Bound<'py, PyDict>,
     limit: Option<i64>,
     fields: Option<Vec<String>>,
     tx: Option<PyObject>,
-) -> PyResult<Bound<'_, PyAny>> {
+) -> PyResult<Bound<'py, PyAny>> {
+    let pool_guard = POOL.read().unwrap();
+    let pool = pool_guard
+        .as_ref()
+        .ok_or_else(|| PyException::new_err("Connection pool not initialized"))?
+        .clone();
+    let url_guard = URL.read().unwrap();
+    let url = url_guard
+        .as_ref()
+        .ok_or_else(|| PyException::new_err("Connection URL not initialized"))?
+        .clone();
+
+    let tx_mutex = if let Some(tx_obj) = tx {
+        if let Ok(session) = tx_obj.extract::<engine::session::Session>(py) {
+            Some(session.transaction)
+        } else if let Ok(tx_handle) = tx_obj.extract::<engine::transaction::TxHandle>(py) {
+            Some(tx_handle.inner)
+        } else {
+            return Err(PyValueError::new_err("Invalid transaction or session object"));
+        }
+    } else {
+        None
+    };
+
+    let table_clone = table.clone();
+    let mut query_filters: HashMap<String, QueryValue> = HashMap::new();
+    for (k, v) in filters {
+        let key = k.extract::<String>()?;
+        query_filters.insert(key.clone(), py_to_query_value(py, &v, &table_clone, &key));
+    }
+
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let rows = engine::db::generic_query(
+            &pool,
+            tx_mutex.as_ref(),
+            &url,
+            &table,
+            query_filters,
+            limit,
+            fields,
+        )
+        .await
+        .map_err(bridge_error_to_py)?;
+
+        let buffer = engine::arrow::rows_to_arrow_ipc(&table, &rows).map_err(bridge_error_to_py)?;
+        
+        Python::with_gil(|py| {
+             let bytes = PyBytes::new_bound(py, &buffer);
+             Ok(bytes.to_object(py))
+        })
+    })
+}
+
+#[pyfunction]
+#[pyo3(signature = (table, filters, limit=None, fields=None, tx=None))]
+fn fetch_all<'py>(
+    py: Python<'py>,
+    table: String,
+    filters: Bound<'py, PyDict>,
+    limit: Option<i64>,
+    fields: Option<Vec<String>>,
+    tx: Option<PyObject>,
+) -> PyResult<Bound<'py, PyAny>> {
     let pool_guard = POOL.read().unwrap();
     let pool = pool_guard
         .as_ref()
@@ -588,12 +673,12 @@ fn set_telemetry_logger(logger: PyObject) -> PyResult<()> {
 
 #[pyfunction]
 #[pyo3(signature = (table, items, tx=None))]
-fn insert_rows_bulk(
-    py: Python<'_>,
+fn insert_rows_bulk<'py>(
+    py: Python<'py>,
     table: String,
-    items: Vec<Bound<'_, PyDict>>,
+    items: Vec<Bound<'py, PyDict>>,
     tx: Option<PyObject>,
-) -> PyResult<Bound<'_, PyAny>> {
+) -> PyResult<Bound<'py, PyAny>> {
     let pool_guard = POOL.read().unwrap();
     let pool = pool_guard
         .as_ref()
@@ -879,11 +964,11 @@ fn snapshot_entity(
 }
 
 #[pyfunction]
-fn flush(
-    py: Python<'_>,
+fn flush<'py>(
+    py: Python<'py>,
     session: engine::session::Session,
-    dirty_entities: Vec<(String, String, Bound<'_, PyDict>, Bound<'_, PyDict>)>,
-) -> PyResult<Bound<'_, PyAny>> {
+    dirty_entities: Vec<(String, String, Bound<'py, PyDict>, Bound<'py, PyDict>)>,
+) -> PyResult<Bound<'py, PyAny>> {
     let pool_guard = POOL.read().unwrap();
     let pool = pool_guard
         .as_ref()
@@ -971,6 +1056,7 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(insert_rows_bulk, m)?)?;
     m.add_function(wrap_pyfunction!(find_one, m)?)?;
     m.add_function(wrap_pyfunction!(fetch_all, m)?)?;
+    m.add_function(wrap_pyfunction!(fetch_all_arrow, m)?)?;
     m.add_function(wrap_pyfunction!(fetch_lazy, m)?)?;
     m.add_function(wrap_pyfunction!(snapshot_entity, m)?)?;
     m.add_function(wrap_pyfunction!(flush, m)?)?;
