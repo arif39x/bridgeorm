@@ -126,7 +126,7 @@ class BaseModel:
 
             data["updated_at"] = datetime.now(timezone.utc)
 
-        # Call generic Rust insert. Note: tx can be Session or TxHandle.
+        # Call generic Rust insert. tx can be Session or TxHandle.
         # If it's a Session, the Rust FFI extracts its inner transaction.
         rs_tx = tx._rs_session if hasattr(tx, "_rs_session") else tx
         raw_res = await bridge_orm_rs.insert_row(cls.table, data, tx=rs_tx)
