@@ -1,9 +1,10 @@
 import argparse
 import asyncio
 import os
+
 from .. import connect, execute_raw
-from ..schema import reflect_table
-from ..schema import MigrationEngine, MIGRATIONS_DIR
+from ..schema import MIGRATIONS_DIR, MigrationEngine, reflect_table
+
 
 async def main():
     parser = argparse.ArgumentParser(description="BridgeORM CLI")
@@ -16,8 +17,15 @@ async def main():
     reflect_parser.add_argument("--output", help="Output file path")
 
     # Makemigrations Command
-    mm_parser = subparsers.add_parser("makemigrations", help="Generate SQL migrations from models")
-    mm_parser.add_argument("--dialect", default="sqlite", choices=["sqlite", "postgres"], help="Database dialect")
+    mm_parser = subparsers.add_parser(
+        "makemigrations", help="Generate SQL migrations from models"
+    )
+    mm_parser.add_argument(
+        "--dialect",
+        default="sqlite",
+        choices=["sqlite", "postgres"],
+        help="Database dialect",
+    )
     mm_parser.add_argument("--name", default="auto", help="Migration name")
 
     # Migrate Command
@@ -38,7 +46,9 @@ async def main():
     elif args.command == "makemigrations":
         # Import models from current directory to register them
         import sys
-        import import_module_from_path # Helper if needed, but for now assume models are in models.py
+
+        import import_module_from_path  # Helper if needed, but for now assume models are in models.py
+
         try:
             # Try to discover models in common locations
             if os.path.exists("models.py"):
@@ -47,13 +57,13 @@ async def main():
                 from . import models
         except Exception as e:
             print(f"Warning: Failed to auto-discover models: {e}")
-            
+
         engine = MigrationEngine(dialect=args.dialect)
         engine.generate_migration(args.name)
 
     elif args.command == "migrate":
         await connect(args.url)
-        
+
         # Create migrations table if not exists
         await execute_raw("""
             CREATE TABLE IF NOT EXISTS _bridge_migrations (
@@ -62,11 +72,9 @@ async def main():
                 applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
-        
+
         # Get applied migrations
-        # Since we don't have a direct query for Any yet, use a quick hack
-        # For prototype, we'll just check files against the table
-        
+
         files = sorted([f for f in os.listdir(MIGRATIONS_DIR) if f.endswith(".sql")])
         for f in files:
             try:
@@ -74,12 +82,15 @@ async def main():
                     sql = sql_file.read()
                     print(f"Applying {f}...")
                     await execute_raw(sql)
-                    await execute_raw(f"INSERT INTO _bridge_migrations (name) VALUES ('{f}')")
+                    await execute_raw(
+                        f"INSERT INTO _bridge_migrations (name) VALUES ('{f}')"
+                    )
             except Exception as e:
                 if "UNIQUE constraint failed" in str(e):
-                    continue # Already applied
+                    continue  # Already applied
                 print(f"Error applying {f}: {e}")
                 break
+
 
 if __name__ == "__main__":
     asyncio.run(main())

@@ -178,9 +178,9 @@ fn bind_query_value<'q>(
         QueryValue::Int(i) => query.bind(i),
         QueryValue::Float(f) => query.bind(f),
         QueryValue::Bool(b) => query.bind(b),
-        QueryValue::Uuid(u) => query.bind(u),
-        QueryValue::DateTime(dt) => query.bind(dt),
-        QueryValue::Json(j) => query.bind(j),
+        QueryValue::Uuid(u) => query.bind(u.to_string()),
+        QueryValue::DateTime(dt) => query.bind(dt.to_rfc3339()),
+        QueryValue::Json(j) => query.bind(j.to_string()),
         QueryValue::Bytes(b) => query.bind(b),
         QueryValue::Raw(_) => panic!("RawExpression should have been expanded before binding"),
         QueryValue::Null => query.bind(None::<String>),
@@ -298,22 +298,22 @@ pub async fn generic_insert(
     let mut values = Vec::new();
     let mut placeholders = Vec::new();
 
-    for (col, val) in data {
-        validate_identifier(&col)?;
-        columns.push(col);
+    for (col, val) in &data {
+        validate_identifier(col)?;
+        columns.push(col.clone());
         match val {
             QueryValue::Raw(raw) => {
                 let mut sql_fragment = raw.sql.clone();
-                for p in raw.params {
+                for p in &raw.params {
                     let placeholder = dialect.get_placeholder(values.len());
                     sql_fragment = sql_fragment.replacen("{}", &placeholder, 1);
-                    values.push(p);
+                    values.push(p.clone());
                 }
                 placeholders.push(sql_fragment);
             }
             _ => {
                 placeholders.push(dialect.get_placeholder(values.len()));
-                values.push(val);
+                values.push(val.clone());
             }
         }
     }

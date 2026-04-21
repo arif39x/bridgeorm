@@ -105,6 +105,42 @@ class QueryBuilder:
         except Exception as e:
             raise DatabaseError(f"Fetch failed: {e}") from e
 
+    async def fetch_arrow(self, tx: Any = None) -> List[Any]:
+        """
+        Execute the query using Apache Arrow for high-performance marshalling.
+        Returns LazyModelProxy instances that materialize on access.
+        """
+        import io
+        import pyarrow as pa
+        from .lazy import LazyModelProxy
+        
+        filters = self._filters
+        try:
+            # Handle Session or TxHandle
+            rs_tx = tx._rs_session if hasattr(tx, "_rs_session") else tx
+            ipc_bytes = await bridge_orm_rs.fetch_all_arrow(
+                self.model_class.table, filters, self._limit, self._projection, tx=rs_tx
+            )
+            
+            if not ipc_bytes:
+                return []
+                
+            with pa.ipc.open_stream(io.BytesIO(ipc_bytes)) as reader:
+                batch = reader.read_next_batch()
+                
+            return [
+                LazyModelProxy(
+                    batch, 
+                    i, 
+                    self.model_class, 
+                    session=tx, 
+                    projected_fields=self._projection
+                )
+                for i in range(batch.num_rows)
+            ]
+        except Exception as e:
+            raise DatabaseError(f"Arrow fetch failed: {e}") from e
+
     async def fetch_lazy(self, tx: Any = None) -> AsyncIterator[Any]:
         """
         Execute the query and return an async iterator for the results.

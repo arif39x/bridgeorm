@@ -1,8 +1,8 @@
-mod engine;
-mod error;
-mod ffi;
-mod schema;
-mod telemetry;
+pub mod engine;
+pub mod error;
+pub mod ffi;
+pub mod schema;
+pub mod telemetry;
 
 pub use error::{BridgeOrmError, BridgeOrmResult};
 
