@@ -7,6 +7,7 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+*.pyd
 .Python
 env/
 build/
@@ -40,6 +41,8 @@ coverage.xml
 *.cover
 .hypothesis/
 
+# NOTE: .benchmarks/ is NOT ignored to keep test results as requested
+
 # IDEs
 .vscode/
 .idea/
@@ -53,7 +56,6 @@ Thumbs.db
 # Databases
 *.db
 !tests/**/test.db
-testdb/
-testdb/
+
+# Misc
 .pyi
-target/
