@@ -32,6 +32,7 @@ ENV/
 
 # Tests & Coverage
 .pytest_cache/
+.benchmarks/
 .coverage
 htmlcov/
 .tox/
@@ -41,7 +42,6 @@ coverage.xml
 *.cover
 .hypothesis/
 
-# NOTE: .benchmarks/ is NOT ignored to keep test results as requested
 
 # IDEs
 .vscode/
