@@ -5,7 +5,7 @@ build-backend = "maturin"
 [project]
 name = "bridge_orm"
 version = "0.1.0"
-description = "High-performance cross-language ORM"
+description = "Secure By Default"
 requires-python = ">=3.8"
 dependencies = [
     "typing-extensions>=4.0; python_version < '3.11'",

@@ -48,6 +48,14 @@ pub enum BridgeOrmError {
 
     #[error("Internal error: {0}\n{1}")]
     Internal(String, DiagnosticInfo),
+
+    #[error("Type mismatch error: field {field}, expected {expected}, got {got}\n{info}")]
+    TypeMismatch {
+        field: String,
+        expected: String,
+        got: String,
+        info: DiagnosticInfo,
+    },
 }
 
 impl From<sqlx::Error> for BridgeOrmError {
@@ -71,6 +79,7 @@ impl BridgeOrmError {
             Self::NotFound(_, ref mut info) => info,
             Self::Configuration(_, ref mut info) => info,
             Self::Internal(_, ref mut info) => info,
+            Self::TypeMismatch { ref mut info, .. } => info,
         };
         info.breadcrumbs.push(crumb.to_string());
         self
@@ -84,6 +93,7 @@ impl BridgeOrmError {
             Self::NotFound(_, ref mut info) => info,
             Self::Configuration(_, ref mut info) => info,
             Self::Internal(_, ref mut info) => info,
+            Self::TypeMismatch { ref mut info, .. } => info,
         };
         info.sql = Some(sql);
         info.params = params;

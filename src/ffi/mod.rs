@@ -3,6 +3,7 @@ use crate::error::{BridgeOrmError, BridgeOrmResult};
 use crate::schema;
 use crate::telemetry;
 pub mod java;
+pub mod pool_config;
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use once_cell::sync::Lazy;
@@ -69,102 +70,51 @@ fn query_value_to_py(py: Python<'_>, v: QueryValue) -> PyObject {
     }
 }
 
-fn py_to_query_value(py: Python<'_>, obj: &Bound<'_, PyAny>, table_name: &str, column_name: &str) -> QueryValue {
+fn py_to_query_value(py: Python<'_>, obj: &Bound<'_, PyAny>, table_name: &str, column_name: &str) -> BridgeOrmResult<QueryValue> {
     if obj.is_none() {
-        return QueryValue::Null;
+        return Ok(QueryValue::Null);
     }
 
     let registry_guard = engine::metadata::REGISTRY.read().unwrap();
     let meta = registry_guard.mappings.get(table_name)
         .and_then(|m| m.columns.get(column_name));
-    
+
     if let Some(m) = meta {
-        match m.data_type.to_lowercase().as_str() {
-            "int" | "bigint" | "integer" => {
-                if let Ok(val) = obj.extract::<i64>() {
-                    return QueryValue::Int(val);
-                }
-            }
-            "bool" | "boolean" => {
-                if let Ok(val) = obj.extract::<bool>() {
-                    return QueryValue::Bool(val);
-                }
-            }
-            "float" | "double precision" | "real" | "double" => {
-                if let Ok(val) = obj.extract::<f64>() {
-                    return QueryValue::Float(val);
-                }
-            }
-            "uuid" => {
-                if let Ok(s) = obj.extract::<String>() {
-                    if let Ok(u) = uuid::Uuid::parse_str(&s) {
-                        return QueryValue::Uuid(u);
-                    }
-                }
-                // If it's a UUID object, to_string() should work
-                if let Ok(u) = uuid::Uuid::parse_str(&obj.to_string()) {
-                    return QueryValue::Uuid(u);
-                }
-            }
-            "datetime" => {
-                if let Ok(s) = obj.extract::<String>() {
-                    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&s) {
-                        return QueryValue::DateTime(dt.with_timezone(&chrono::Utc));
-                    }
-                }
-                // Try fromisoformat if it's a datetime object
-                if let Ok(s) = obj.call_method0("isoformat").and_then(|r| r.extract::<String>()) {
-                    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&s) {
-                        return QueryValue::DateTime(dt.with_timezone(&chrono::Utc));
-                    }
-                }
-            }
-            "json" | "jsonb" => {
-                 let json_module = py.import_bound("json").unwrap();
-                 if let Ok(s) = json_module.call_method1("dumps", (obj,)).and_then(|r| r.extract::<String>()) {
-                     if let Ok(v) = serde_json::from_str(&s) {
-                         return QueryValue::Json(v);
-                     }
-                 }
-            }
-            _ => {}
-        }
+        return crate::ffi::type_coercion::coerce_py_value(obj, m, table_name);
     }
-    
+
     // Default heuristics if meta is missing or doesn't match
     if let Ok(b) = obj.extract::<bool>() {
         // In Python, bool is a subclass of int, so check bool first.
-        // But obj.extract::<bool>() might be too lenient? 
-        // Pyo3's extract::<bool> is usually strict for actual bools.
         if obj.is_instance_of::<pyo3::types::PyBool>() {
-             return QueryValue::Bool(b);
+             return Ok(QueryValue::Bool(b));
         }
     }
 
     if let Ok(i) = obj.extract::<i64>() {
-        return QueryValue::Int(i);
+        return Ok(QueryValue::Int(i));
     }
-    
+
     if let Ok(f) = obj.extract::<f64>() {
-        return QueryValue::Float(f);
+        return Ok(QueryValue::Float(f));
     }
 
     // Heuristics for UUID/DateTime if meta is missing
     if let Ok(u) = uuid::Uuid::parse_str(&obj.to_string()) {
         // Basic check to avoid false positives with random strings
         if !obj.is_instance_of::<pyo3::types::PyString>() {
-             return QueryValue::Uuid(u);
+             return Ok(QueryValue::Uuid(u));
         }
     }
 
     if let Ok(s) = obj.call_method0("isoformat").and_then(|r| r.extract::<String>()) {
         if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&s) {
-            return QueryValue::DateTime(dt.with_timezone(&chrono::Utc));
+            return Ok(QueryValue::DateTime(dt.with_timezone(&chrono::Utc)));
         }
     }
 
     if let Ok(b) = obj.extract::<Vec<u8>>() {
-        return QueryValue::Bytes(b);
+        return Ok(QueryValue::Bytes(b));
     }
 
     // Check for Raw expression
@@ -174,9 +124,9 @@ fn py_to_query_value(py: Python<'_>, obj: &Bound<'_, PyAny>, table_name: &str, c
                 if let Ok(params_py) = params_attr.extract::<Vec<Bound<'_, PyAny>>>() {
                     let mut params = Vec::new();
                     for p in params_py {
-                        params.push(py_to_query_value(py, &p, table_name, column_name));
+                        params.push(py_to_query_value(py, &p, table_name, column_name)?);
                     }
-                    return QueryValue::Raw(crate::engine::query::RawExpression { sql, params });
+                    return Ok(QueryValue::Raw(crate::engine::query::RawExpression { sql, params }));
                 }
             }
         }
@@ -184,9 +134,9 @@ fn py_to_query_value(py: Python<'_>, obj: &Bound<'_, PyAny>, table_name: &str, c
 
     // Default to string representation
     if let Ok(val) = obj.extract::<String>() {
-        QueryValue::String(val)
+        Ok(QueryValue::String(val))
     } else {
-        QueryValue::String(obj.to_string())
+        Ok(QueryValue::String(obj.to_string()))
     }
 }
 
@@ -241,10 +191,11 @@ fn configure_logging(level: String, slow_query_ms: u64) -> PyResult<()> {
 }
 
 #[pyfunction]
-fn connect(py: Python<'_>, url: String) -> PyResult<Bound<'_, PyAny>> {
+#[pyo3(signature = (url, config=None))]
+fn connect(py: Python<'_>, url: String, config: Option<pool_config::PoolConfig>) -> PyResult<Bound<'_, PyAny>> {
     let url_clone = url.clone();
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let pool = engine::db::connect(&url_clone)
+        let pool = engine::db::connect(&url_clone, config)
             .await
             .map_err(bridge_error_to_py)?;
 
@@ -392,7 +343,7 @@ fn insert_row<'py>(
         )
         .await
         .map_err(bridge_error_to_py)?;
-        
+
         Python::with_gil(|py| {
             let dict = PyDict::new_bound(py);
             for (k, v) in res {
@@ -412,59 +363,61 @@ fn find_one<'py>(
     fields: Option<Vec<String>>,
     tx: Option<PyObject>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let pool_guard = POOL.read().unwrap();
-    let pool = pool_guard
-        .as_ref()
-        .ok_or_else(|| PyException::new_err("Connection pool not initialized"))?
-        .clone();
+    ffi_guard!(py, {
+        let pool_guard = POOL.read().unwrap();
+        let pool = pool_guard
+            .as_ref()
+            .ok_or_else(|| PyException::new_err("Connection pool not initialized"))?
+            .clone();
 
-    let url_guard = URL.read().unwrap();
-    let url = url_guard
-        .as_ref()
-        .ok_or_else(|| PyException::new_err("Connection URL not initialized"))?
-        .clone();
+        let url_guard = URL.read().unwrap();
+        let url = url_guard
+            .as_ref()
+            .ok_or_else(|| PyException::new_err("Connection URL not initialized"))?
+            .clone();
 
-    // Extract TxHandle or Session if provided
-    let tx_mutex = if let Some(tx_obj) = tx {
-        if let Ok(session) = tx_obj.extract::<engine::session::Session>(py) {
-            Some(session.transaction)
-        } else if let Ok(tx_handle) = tx_obj.extract::<engine::transaction::TxHandle>(py) {
-            Some(tx_handle.inner)
+        // Extract TxHandle or Session if provided
+        let tx_mutex = if let Some(tx_obj) = tx {
+            if let Ok(session) = tx_obj.extract::<engine::session::Session>(py) {
+                Some(session.transaction)
+            } else if let Ok(tx_handle) = tx_obj.extract::<engine::transaction::TxHandle>(py) {
+                Some(tx_handle.inner)
+            } else {
+                return Err(PyValueError::new_err("Invalid transaction or session object"));
+            }
         } else {
-            return Err(PyValueError::new_err("Invalid transaction or session object"));
+            None
+        };
+
+        let table_clone = table.clone();
+        let mut query_filters: HashMap<String, QueryValue> = HashMap::new();
+        for (k, v) in filters {
+            let key = k.extract::<String>()?;
+            query_filters.insert(key.clone(), py_to_query_value(py, &v, &table_clone, &key).map_err(bridge_error_to_py)?);
         }
-    } else {
-        None
-    };
 
-    let table_clone = table.clone();
-    let mut query_filters: HashMap<String, QueryValue> = HashMap::new();
-    for (k, v) in filters {
-        let key = k.extract::<String>()?;
-        query_filters.insert(key.clone(), py_to_query_value(py, &v, &table_clone, &key));
-    }
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let rows = engine::db::generic_query(
+                &pool,
+                tx_mutex.as_ref(),
+                &url,
+                &table,
+                query_filters,
+                Some(1),
+                fields,
+            )
+            .await
+            .map_err(bridge_error_to_py)?;
 
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let rows = engine::db::generic_query(
-            &pool,
-            tx_mutex.as_ref(),
-            &url,
-            &table,
-            query_filters,
-            Some(1),
-            fields,
-        )
-        .await
-        .map_err(bridge_error_to_py)?;
-
-        if rows.is_empty() {
-            Ok(Python::with_gil(|py| py.None()))
-        } else {
-            Python::with_gil(|py| {
-                let dict = engine::hydrator::hydrate_row(py, &table, &rows[0])?;
-                Ok(dict.to_object(py))
-            })
-        }
+            if rows.is_empty() {
+                Ok(Python::with_gil(|py| py.None()))
+            } else {
+                Python::with_gil(|py| {
+                    let dict = engine::hydrator::hydrate_row(py, &table, &rows[0])?;
+                    Ok(dict.to_object(py))
+                })
+            }
+        })
     })
 }
 
@@ -522,7 +475,7 @@ fn fetch_all_arrow<'py>(
         .map_err(bridge_error_to_py)?;
 
         let buffer = engine::arrow::rows_to_arrow_ipc(&table, &rows).map_err(bridge_error_to_py)?;
-        
+
         Python::with_gil(|py| {
              let bytes = PyBytes::new_bound(py, &buffer);
              Ok(bytes.to_object(py))
@@ -584,7 +537,7 @@ fn fetch_all<'py>(
         )
         .await
         .map_err(bridge_error_to_py)?;
-        
+
         Python::with_gil(|py| {
             let mut results = Vec::new();
             for row in rows {
@@ -606,42 +559,44 @@ fn fetch_lazy(
     fields: Option<Vec<String>>,
     tx: Option<PyObject>,
 ) -> PyResult<LazyRowStream> {
-    let pool_guard = POOL.read().unwrap();
-    let pool = pool_guard
-        .as_ref()
-        .ok_or_else(|| PyException::new_err("Connection pool not initialized"))?;
+    ffi_guard!(py, {
+        let pool_guard = POOL.read().unwrap();
+        let pool = pool_guard
+            .as_ref()
+            .ok_or_else(|| PyException::new_err("Connection pool not initialized"))?;
 
-    let url_guard = URL.read().unwrap();
-    let url = url_guard
-        .as_ref()
-        .ok_or_else(|| PyException::new_err("Connection URL not initialized"))?;
+        let url_guard = URL.read().unwrap();
+        let url = url_guard
+            .as_ref()
+            .ok_or_else(|| PyException::new_err("Connection URL not initialized"))?;
 
-    // Extract TxHandle or Session if provided
-    let tx_mutex = if let Some(tx_obj) = tx {
-        if let Ok(session) = tx_obj.extract::<engine::session::Session>(py) {
-            Some(session.transaction)
-        } else if let Ok(tx_handle) = tx_obj.extract::<engine::transaction::TxHandle>(py) {
-            Some(tx_handle.inner)
+        // Extract TxHandle or Session if provided
+        let tx_mutex = if let Some(tx_obj) = tx {
+            if let Ok(session) = tx_obj.extract::<engine::session::Session>(py) {
+                Some(session.transaction)
+            } else if let Ok(tx_handle) = tx_obj.extract::<engine::transaction::TxHandle>(py) {
+                Some(tx_handle.inner)
+            } else {
+                return Err(PyValueError::new_err("Invalid transaction or session object"));
+            }
         } else {
-            return Err(PyValueError::new_err("Invalid transaction or session object"));
+            None
+        };
+
+        let table_clone = table.clone();
+        let mut query_filters: HashMap<String, QueryValue> = HashMap::new();
+        for (k, v) in filters {
+            let key = k.extract::<String>()?;
+            query_filters.insert(key.clone(), py_to_query_value(py, &v, &table_clone, &key).map_err(bridge_error_to_py)?);
         }
-    } else {
-        None
-    };
 
-    let table_clone = table.clone();
-    let mut query_filters: HashMap<String, QueryValue> = HashMap::new();
-    for (k, v) in filters {
-        let key = k.extract::<String>()?;
-        query_filters.insert(key.clone(), py_to_query_value(py, &v, &table_clone, &key));
-    }
+        let stream = engine::db::query_lazy(pool, tx_mutex, url, &table, query_filters, limit, fields)
+            .map_err(bridge_error_to_py)?;
 
-    let stream = engine::db::query_lazy(pool, tx_mutex, url, &table, query_filters, limit, fields)
-        .map_err(bridge_error_to_py)?;
-
-    Ok(LazyRowStream {
-        stream: Arc::new(Mutex::new(stream)),
-        table_name: table,
+        Ok(LazyRowStream {
+            stream: Arc::new(Mutex::new(stream)),
+            table_name: table,
+        })
     })
 }
 
@@ -725,7 +680,7 @@ fn insert_rows_bulk<'py>(
         )
         .await
         .map_err(bridge_error_to_py)?;
-        
+
         Python::with_gil(|py| {
             let mut results = Vec::new();
             for item in res {
@@ -969,46 +924,111 @@ fn flush<'py>(
     session: engine::session::Session,
     dirty_entities: Vec<(String, String, Bound<'py, PyDict>, Bound<'py, PyDict>)>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let pool_guard = POOL.read().unwrap();
-    let pool = pool_guard
-        .as_ref()
-        .ok_or_else(|| PyException::new_err("Connection pool not initialized"))?
-        .clone();
+    ffi_guard!(py, {
+        let pool_guard = POOL.read().unwrap();
+        let pool = pool_guard
+            .as_ref()
+            .ok_or_else(|| PyException::new_err("Connection pool not initialized"))?
+            .clone();
 
-    let url_guard = URL.read().unwrap();
-    let url = url_guard
-        .as_ref()
-        .ok_or_else(|| PyException::new_err("Connection URL not initialized"))?
-        .clone();
+        let url_guard = URL.read().unwrap();
+        let url = url_guard
+            .as_ref()
+            .ok_or_else(|| PyException::new_err("Connection URL not initialized"))?
+            .clone();
 
-    // To make it Send-safe, we compute diffs and prepare updates synchronously (with GIL)
-    // and then only pass pure Rust data into the async block.
-    
-    struct UpdateJob {
-        table_name: String,
-        diff: HashMap<String, QueryValue>,
-        pk_filters: HashMap<String, QueryValue>,
-        key: String,
-        full_values: HashMap<String, QueryValue>,
-    }
-    
-    let mut jobs = Vec::new();
-    {
-        let tracker_guard = session.dirty_tracker.lock().map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
-        for (key, table_name, current_values_py, pk_filters_py) in dirty_entities {
-            let mut current_values = HashMap::new();
-            for (k, v) in current_values_py {
-                let col_name = k.extract::<String>()?;
-                current_values.insert(col_name.clone(), py_to_query_value(py, &v, &table_name, &col_name));
-            }
-            
-            if let Some(diff) = tracker_guard.compute_diff(&key, &current_values) {
-                let mut pk_filters = HashMap::new();
-                for (k, v) in pk_filters_py {
+        // To make it Send-safe, compute diffs and prepare updates synchronously (with GIL)
+        // and then only pass pure Rust data into the async block.
+
+        struct UpdateJob {
+            table_name: String,
+            diff: HashMap<String, QueryValue>,
+            pk_filters: HashMap<String, QueryValue>,
+            key: String,
+            full_values: HashMap<String, QueryValue>,
+        }
+
+        let mut jobs = Vec::new();
+        {
+            let tracker_guard = session.dirty_tracker.lock().map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
+            for (key, table_name, current_values_py, pk_filters_py) in dirty_entities {
+                let mut current_values = HashMap::new();
+                for (k, v) in current_values_py {
                     let col_name = k.extract::<String>()?;
-                    pk_filters.insert(col_name.clone(), py_to_query_value(py, &v, &table_name, &col_name));
+                    current_values.insert(col_name.clone(), py_to_query_value(py, &v, &table_name, &col_name).map_err(bridge_error_to_py)?);
                 }
-                
+
+                if let Some(diff) = tracker_guard.compute_diff(&key, &current_values) {
+                    let mut pk_filters = HashMap::new();
+                    for (k, v) in pk_filters_py {
+                        let col_name = k.extract::<String>()?;
+                        pk_filters.insert(col_name.clone(), py_to_query_value(py, &v, &table_name, &col_name).map_err(bridge_error_to_py)?);
+                    }
+
+                    jobs.push(UpdateJob {
+                        table_name,
+                        diff,
+                        pk_filters,
+                        key,
+                        full_values: current_values,
+                    });
+                }
+            }
+        }
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            for job in jobs {
+                engine::db::generic_update(
+                    &pool,
+                    Some(&session.transaction),
+                    &url,
+                    &job.table_name,
+                    job.diff,
+                    job.pk_filters
+                ).await.map_err(bridge_error_to_py)?;
+
+                // Re-acquire lock to update snapshot
+                let mut tracker_guard = session.dirty_tracker.lock().map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
+                tracker_guard.take_snapshot(job.key, job.table_name, job.full_values);
+            }
+            Ok(())
+        })
+    })
+}
+
+pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<ColumnMetaProxy>()?;
+    m.add_class::<TableMetaProxy>()?;
+    m.add_class::<LazyRowStream>()?;
+    m.add_class::<engine::transaction::TxHandle>()?;
+    m.add_class::<engine::session::Session>()?;
+    m.add_function(wrap_pyfunction!(set_telemetry_logger, m)?)?;
+    m.add_function(wrap_pyfunction!(configure_logging, m)?)?;
+    m.add_function(wrap_pyfunction!(connect, m)?)?;
+    m.add_function(wrap_pyfunction!(reflect_schema, m)?)?;
+    m.add_function(wrap_pyfunction!(reflect_table, m)?)?;
+
+    m.add_function(wrap_pyfunction!(begin_session, m)?)?;
+    m.add_function(wrap_pyfunction!(insert_row, m)?)?;
+    m.add_function(wrap_pyfunction!(insert_rows_bulk, m)?)?;
+    m.add_function(wrap_pyfunction!(find_one, m)?)?;
+    m.add_function(wrap_pyfunction!(fetch_all, m)?)?;
+    m.add_function(wrap_pyfunction!(fetch_all_arrow, m)?)?;
+    m.add_function(wrap_pyfunction!(fetch_lazy, m)?)?;
+    m.add_function(wrap_pyfunction!(snapshot_entity, m)?)?;
+    m.add_function(wrap_pyfunction!(flush, m)?)?;
+    m.add_function(wrap_pyfunction!(fetch_one_to_many, m)?)?;
+    m.add_function(wrap_pyfunction!(fetch_many_to_many, m)?)?;
+    m.add_function(wrap_pyfunction!(fetch_self_ref, m)?)?;
+    m.add_function(wrap_pyfunction!(execute_raw, m)?)?;
+    m.add_function(wrap_pyfunction!(resolve_type, m)?)?;
+    m.add_function(wrap_pyfunction!(engine::metadata::register_entity, m)?)?;
+    m.add_function(wrap_pyfunction!(engine::metadata::lock_registry, m)?)?;
+    Ok(())
+}
+alue(py, &v, &table_name, &col_name));
+                }
+
                 jobs.push(UpdateJob {
                     table_name,
                     diff,
@@ -1030,7 +1050,7 @@ fn flush<'py>(
                 job.diff,
                 job.pk_filters
             ).await.map_err(bridge_error_to_py)?;
-            
+
             // Re-acquire lock to update snapshot
             let mut tracker_guard = session.dirty_tracker.lock().map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
             tracker_guard.take_snapshot(job.key, job.table_name, job.full_values);
@@ -1067,5 +1087,8 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(resolve_type, m)?)?;
     m.add_function(wrap_pyfunction!(engine::metadata::register_entity, m)?)?;
     m.add_function(wrap_pyfunction!(engine::metadata::lock_registry, m)?)?;
+    Ok(())
+}
+n(wrap_pyfunction!(engine::metadata::lock_registry, m)?)?;
     Ok(())
 }

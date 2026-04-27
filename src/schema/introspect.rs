@@ -30,45 +30,41 @@ pub struct TableMeta {
 
 /// Reflects the entire schema of the database.
 #[must_use]
-pub async fn reflect_schema(
-    pool: &AnyPool,
-    url: &str,
-) -> BridgeOrmResult<Vec<TableMeta>> {
+pub async fn reflect_schema(pool: &AnyPool, url: &str) -> BridgeOrmResult<Vec<TableMeta>> {
     let dialect = SqlDialect::from_url(url);
-    
+
     // Get list of tables
     let tables: Vec<String> = match dialect {
-        SqlDialect::Sqlite => {
-            sqlx::query("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'")
-                .fetch_all(pool)
-                .await?
-                .into_iter()
-                .map(|r| r.get(0))
-                .collect()
-        }
-        SqlDialect::Postgres => {
-            sqlx::query("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'")
-                .fetch_all(pool)
-                .await?
-                .into_iter()
-                .map(|r| r.get(0))
-                .collect()
-        }
-        _ => {
-            sqlx::query("SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE()")
-                .fetch_all(pool)
-                .await?
-                .into_iter()
-                .map(|r| r.get(0))
-                .collect()
-        }
+        SqlDialect::Sqlite => sqlx::query(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+        )
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(|r| r.get(0))
+        .collect(),
+        SqlDialect::Postgres => sqlx::query(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'",
+        )
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(|r| r.get(0))
+        .collect(),
+        _ => sqlx::query(
+            "SELECT table_name FROM information_schema.tables WHERE table_schema = DATABASE()",
+        )
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(|r| r.get(0))
+        .collect(),
     };
 
     let mut schema = Vec::new();
     for table_name in tables {
         let columns = reflect_table(pool, url, &table_name).await?;
-        // For indexes, we'd need dialect-specific logic here too.
-        // Simplified for now.
+        // For indexes, need dialect-specific logic here too.
         schema.push(TableMeta {
             name: table_name,
             columns,
@@ -114,7 +110,7 @@ async fn reflect_information_schema(
             name: row.get("column_name"),
             data_type: row.get("data_type"),
             is_nullable: row.get::<String, _>("is_nullable") == "YES",
-            is_primary_key: false, // Would need to query information_schema.key_column_usage
+            is_primary_key: false,
             default_value: row.try_get("column_default").ok(),
         });
     }
