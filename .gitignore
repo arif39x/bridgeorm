@@ -1,8 +1,5 @@
-# Rust
 /target/
 Cargo.lock
-
-# Python
 __pycache__/
 *.py[cod]
 *$py.class
@@ -29,8 +26,6 @@ venv/
 .venv/
 ENV/
 .env
-
-# Tests & Coverage
 .pytest_cache/
 .benchmarks/
 .coverage
@@ -41,21 +36,12 @@ nosetests.xml
 coverage.xml
 *.cover
 .hypothesis/
-
-
-# IDEs
 .vscode/
 .idea/
 *.swp
 *.swo
-
-# OS
 .DS_Store
 Thumbs.db
-
-# Databases
 *.db
 !tests/**/test.db
-
-# Misc
 .pyi

@@ -1,3 +1,4 @@
+use crate::engine::query::QueryValue;
 use crate::error::{BridgeOrmError, BridgeOrmResult, DiagnosticInfo};
 use crate::telemetry::logger::{self, TelemetryEvent};
 use futures::stream::BoxStream;
@@ -9,7 +10,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::Mutex;
-use crate::engine::query::QueryValue;
 
 /// Constants for SQL validation and formatting.
 const VALID_IDENTIFIER_REGEX: &str = r"^[a-zA-Z_][a-zA-Z0-9_]*$";
@@ -20,6 +20,11 @@ const RESERVED_KEYWORDS: [&str; 8] = [
 pub static VALID_SQL_IDENTIFIER_PATTERN: Lazy<Regex> =
     Lazy::new(|| Regex::new(VALID_IDENTIFIER_REGEX).expect("Invalid hardcoded regex pattern"));
 
+pub static CIRCUIT_BREAKER: Lazy<crate::engine::circuit_breaker::CircuitBreaker> =
+    Lazy::new(|| {
+        crate::engine::circuit_breaker::CircuitBreaker::new(5, std::time::Duration::from_secs(30))
+    });
+
 /// Represents supported SQL dialects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -28,6 +33,14 @@ pub enum SqlDialect {
     Sqlite,
     MySql,
     MsSql,
+    Oracle,
+    CockroachDb,
+    MariaDb,
+    PlanetScale,
+    Neon,
+    YugabyteDb,
+    CloudflareD1,
+    Dolt,
 }
 
 pub trait Dialect: Send + Sync {
@@ -35,11 +48,21 @@ pub trait Dialect: Send + Sync {
     fn quote_identifier(&self, identifier: &str) -> String {
         format!("\"{}\"", identifier)
     }
-    fn build_select(&self, table: &str, columns: &[String], filters: &[(String, QueryValue)], limit: Option<i64>) -> (String, Vec<QueryValue>) {
-        let cols = if columns.is_empty() { "*".to_string() } else { columns.join(", ") };
+    fn build_select(
+        &self,
+        table: &str,
+        columns: &[String],
+        filters: &[(String, QueryValue)],
+        limit: Option<i64>,
+    ) -> (String, Vec<QueryValue>) {
+        let cols = if columns.is_empty() {
+            "*".to_string()
+        } else {
+            columns.join(", ")
+        };
         let mut sql = format!("SELECT {} FROM {}", cols, table);
         let mut values = Vec::new();
-        
+
         if !filters.is_empty() {
             sql.push_str(" WHERE ");
             let mut conditions = Vec::new();
@@ -55,18 +78,22 @@ pub trait Dialect: Send + Sync {
                         conditions.push(format!("{} {}", col, sql_fragment));
                     }
                     _ => {
-                        conditions.push(format!("{} = {}", col, self.get_placeholder(values.len())));
+                        conditions.push(format!(
+                            "{} = {}",
+                            col,
+                            self.get_placeholder(values.len())
+                        ));
                         values.push(val.clone());
                     }
                 }
             }
             sql.push_str(&conditions.join(" AND "));
         }
-        
+
         if let Some(l) = limit {
             sql.push_str(&format!(" LIMIT {}", l));
         }
-        
+
         (sql, values)
     }
 }
@@ -95,18 +122,108 @@ impl Dialect for MySqlDialect {
     }
 }
 
+pub struct MsSqlDialect;
+impl Dialect for MsSqlDialect {
+    fn get_placeholder(&self, index: usize) -> String {
+        format!("@p{}", index + 1)
+    }
+    fn quote_identifier(&self, identifier: &str) -> String {
+        format!("[{}]", identifier)
+    }
+}
+
+pub struct OracleDialect;
+impl Dialect for OracleDialect {
+    fn get_placeholder(&self, index: usize) -> String {
+        format!(":{}", index + 1)
+    }
+    fn build_select(
+        &self,
+        table: &str,
+        columns: &[String],
+        filters: &[(String, QueryValue)],
+        limit: Option<i64>,
+    ) -> (String, Vec<QueryValue>) {
+        let cols = if columns.is_empty() {
+            "*".to_string()
+        } else {
+            columns.join(", ")
+        };
+        let mut sql = format!("SELECT {} FROM {}", cols, table);
+        let mut values = Vec::new();
+
+        if !filters.is_empty() {
+            sql.push_str(" WHERE ");
+            let mut conditions = Vec::new();
+            for (col, val) in filters {
+                match val {
+                    QueryValue::Raw(raw) => {
+                        let mut sql_fragment = raw.sql.clone();
+                        for p in &raw.params {
+                            let placeholder = self.get_placeholder(values.len());
+                            sql_fragment = sql_fragment.replacen("{}", &placeholder, 1);
+                            values.push(p.clone());
+                        }
+                        conditions.push(format!("{} {}", col, sql_fragment));
+                    }
+                    _ => {
+                        conditions.push(format!(
+                            "{} = {}",
+                            col,
+                            self.get_placeholder(values.len())
+                        ));
+                        values.push(val.clone());
+                    }
+                }
+            }
+            sql.push_str(&conditions.join(" AND "));
+        }
+
+        if let Some(l) = limit {
+            // Oracle uses OFFSET/FETCH for modern pagination
+            sql.push_str(&format!(" FETCH NEXT {} ROWS ONLY", l));
+        }
+
+        (sql, values)
+    }
+}
+
 impl SqlDialect {
     /// Infers the SQL dialect from the connection URL.
     #[must_use]
     pub fn from_url(url: &str) -> Self {
+        let url = url.to_lowercase();
         if url.starts_with("postgres://") || url.starts_with("postgresql://") {
+            if url.contains("neon.tech") {
+                return Self::Neon;
+            }
+            if url.contains("yugabyte") {
+                return Self::YugabyteDb;
+            }
+            if url.contains("cockroach") || url.contains(":26257") {
+                return Self::CockroachDb;
+            }
             Self::Postgres
-        } else if url.starts_with("sqlite:") {
+        } else if url.starts_with("sqlite:") || url.contains("d1.cloudflare") {
+            if url.contains("d1.cloudflare") {
+                return Self::CloudflareD1;
+            }
             Self::Sqlite
         } else if url.starts_with("mysql://") || url.starts_with("mariadb://") {
+            if url.contains("mariadb") {
+                return Self::MariaDb;
+            }
+            if url.contains("psdb.cloud") {
+                return Self::PlanetScale;
+            }
+            if url.contains("dolt") {
+                return Self::Dolt;
+            }
             Self::MySql
         } else if url.starts_with("mssql://") || url.starts_with("sqlserver://") {
             Self::MsSql
+        } else if url.starts_with("oracle://") || url.starts_with("thin://") {
+            Self::Oracle
         } else {
             Self::Postgres
         }
@@ -114,10 +231,13 @@ impl SqlDialect {
 
     pub fn to_dialect(&self) -> Box<dyn Dialect> {
         match self {
-            Self::Postgres => Box::new(PostgreSqlDialect),
-            Self::Sqlite => Box::new(SqliteDialect),
-            Self::MySql => Box::new(MySqlDialect),
-            Self::MsSql => Box::new(SqliteDialect), // Fallback for now
+            Self::Postgres | Self::CockroachDb | Self::Neon | Self::YugabyteDb => {
+                Box::new(PostgreSqlDialect)
+            }
+            Self::Sqlite | Self::CloudflareD1 => Box::new(SqliteDialect),
+            Self::MySql | Self::MariaDb | Self::PlanetScale | Self::Dolt => Box::new(MySqlDialect),
+            Self::MsSql => Box::new(MsSqlDialect),
+            Self::Oracle => Box::new(OracleDialect),
         }
     }
 }
@@ -127,26 +247,57 @@ impl SqlDialect {
 pub fn validate_identifier(identifier: &str) -> BridgeOrmResult<()> {
     if !VALID_SQL_IDENTIFIER_PATTERN.is_match(identifier) {
         return Err(BridgeOrmError::Validation(
-            format!("Security Violation: Invalid SQL identifier '{}'", identifier),
+            format!(
+                "Security Violation: Invalid SQL identifier '{}'",
+                identifier
+            ),
             DiagnosticInfo::default(),
         ));
     }
 
     if RESERVED_KEYWORDS.contains(&identifier.to_uppercase().as_str()) {
         return Err(BridgeOrmError::Validation(
-            format!("Security Violation: Reserved keyword '{}' used as identifier", identifier),
+            format!(
+                "Security Violation: Reserved keyword '{}' used as identifier",
+                identifier
+            ),
             DiagnosticInfo::default(),
         ));
     }
     Ok(())
 }
 
-/// Establishes a connection pool using the provided URL.
+/// Establishes a connection pool using the provided URL and configuration.
 /// Uses sqlx's built-in pool.
 #[must_use]
-pub async fn connect(url: &str) -> BridgeOrmResult<AnyPool> {
+pub async fn connect(
+    url: &str,
+    config: Option<crate::ffi::pool_config::PoolConfig>,
+) -> BridgeOrmResult<AnyPool> {
     sqlx::any::install_default_drivers();
-    AnyPool::connect(url).await.map_err(BridgeOrmError::from)
+
+    let mut options = sqlx::any::AnyConnectOptions::from_url(url).map_err(BridgeOrmError::from)?;
+
+    let mut pool_builder = sqlx::any::AnyPoolOptions::new();
+
+    if let Some(cfg) = config {
+        pool_builder = pool_builder
+            .max_connections(cfg.max_connections)
+            .min_connections(cfg.min_connections)
+            .acquire_timeout(std::time::Duration::from_secs(cfg.connect_timeout_sec));
+
+        if let Some(idle) = cfg.idle_timeout_sec {
+            pool_builder = pool_builder.idle_timeout(std::time::Duration::from_secs(idle));
+        }
+        if let Some(lifetime) = cfg.max_lifetime_sec {
+            pool_builder = pool_builder.max_lifetime(std::time::Duration::from_secs(lifetime));
+        }
+    }
+
+    pool_builder
+        .connect_with(options)
+        .await
+        .map_err(BridgeOrmError::from)
 }
 
 /// Shared logic for building placeholders and values for queries.
@@ -223,7 +374,11 @@ pub async fn generic_update(
                 set_clauses.push(format!("{} = {}", col, sql_fragment));
             }
             _ => {
-                set_clauses.push(format!("{} = {}", col, dialect.get_placeholder(values.len())));
+                set_clauses.push(format!(
+                    "{} = {}",
+                    col,
+                    dialect.get_placeholder(values.len())
+                ));
                 values.push(val);
             }
         }
@@ -246,7 +401,11 @@ pub async fn generic_update(
                     where_clauses.push(format!("{} {}", col, sql_fragment));
                 }
                 _ => {
-                    where_clauses.push(format!("{} = {}", col, dialect.get_placeholder(values.len())));
+                    where_clauses.push(format!(
+                        "{} = {}",
+                        col,
+                        dialect.get_placeholder(values.len())
+                    ));
                     values.push(val);
                 }
             }
@@ -261,12 +420,23 @@ pub async fn generic_update(
 
     if let Some(tx_mutex) = tx {
         let mut tx_guard = tx_mutex.lock().await;
-        let tx_conn = tx_guard
-            .as_mut()
-            .ok_or_else(|| BridgeOrmError::Validation("Transaction already closed".to_string(), DiagnosticInfo::default()))?;
-        query.execute(&mut **tx_conn).await.map_err(|e| BridgeOrmError::from(e).with_sql(sql.clone(), None).add_breadcrumb("generic_update"))?;
+        let tx_conn = tx_guard.as_mut().ok_or_else(|| {
+            BridgeOrmError::Validation(
+                "Transaction already closed".to_string(),
+                DiagnosticInfo::default(),
+            )
+        })?;
+        query.execute(&mut **tx_conn).await.map_err(|e| {
+            BridgeOrmError::from(e)
+                .with_sql(sql.clone(), None)
+                .add_breadcrumb("generic_update")
+        })?;
     } else {
-        query.execute(pool).await.map_err(|e| BridgeOrmError::from(e).with_sql(sql.clone(), None).add_breadcrumb("generic_update"))?;
+        query.execute(pool).await.map_err(|e| {
+            BridgeOrmError::from(e)
+                .with_sql(sql.clone(), None)
+                .add_breadcrumb("generic_update")
+        })?;
     }
 
     Ok(())
@@ -276,7 +446,11 @@ pub async fn generic_update(
 #[must_use]
 #[tracing::instrument(skip(pool))]
 pub async fn execute_raw(pool: &AnyPool, sql: &str) -> BridgeOrmResult<()> {
-    sqlx::query(sql).execute(pool).await.map_err(|e| BridgeOrmError::from(e).with_sql(sql.to_string(), None).add_breadcrumb("execute_raw"))?;
+    sqlx::query(sql).execute(pool).await.map_err(|e| {
+        BridgeOrmError::from(e)
+            .with_sql(sql.to_string(), None)
+            .add_breadcrumb("execute_raw")
+    })?;
     Ok(())
 }
 
@@ -293,7 +467,7 @@ pub async fn generic_insert(
     validate_identifier(table_name)?;
     let dialect_type = SqlDialect::from_url(url);
     let dialect = dialect_type.to_dialect();
-    
+
     let mut columns = Vec::new();
     let mut values = Vec::new();
     let mut placeholders = Vec::new();
@@ -333,12 +507,23 @@ pub async fn generic_insert(
 
     if let Some(tx_mutex) = tx {
         let mut tx_guard = tx_mutex.lock().await;
-        let tx_conn = tx_guard
-            .as_mut()
-            .ok_or_else(|| BridgeOrmError::Validation("Transaction already closed".to_string(), DiagnosticInfo::default()))?;
-        query.execute(&mut **tx_conn).await.map_err(|e| BridgeOrmError::from(e).with_sql(sql.clone(), None).add_breadcrumb("generic_insert"))?;
+        let tx_conn = tx_guard.as_mut().ok_or_else(|| {
+            BridgeOrmError::Validation(
+                "Transaction already closed".to_string(),
+                DiagnosticInfo::default(),
+            )
+        })?;
+        query.execute(&mut **tx_conn).await.map_err(|e| {
+            BridgeOrmError::from(e)
+                .with_sql(sql.clone(), None)
+                .add_breadcrumb("generic_insert")
+        })?;
     } else {
-        query.execute(pool).await.map_err(|e| BridgeOrmError::from(e).with_sql(sql.clone(), None).add_breadcrumb("generic_insert"))?;
+        query.execute(pool).await.map_err(|e| {
+            BridgeOrmError::from(e)
+                .with_sql(sql.clone(), None)
+                .add_breadcrumb("generic_insert")
+        })?;
     }
 
     let duration = start.elapsed();
@@ -416,20 +601,23 @@ pub async fn generic_insert_bulk(
 
     if let Some(tx_mutex) = tx {
         let mut tx_guard = tx_mutex.lock().await;
-        let tx_conn = tx_guard
-            .as_mut()
-            .ok_or_else(|| {
-                BridgeOrmError::Validation("Transaction already closed".to_string(), DiagnosticInfo::default())
-            })?;
-        query
-            .execute(&mut **tx_conn)
-            .await
-            .map_err(|e| BridgeOrmError::from(e).with_sql(sql.clone(), None).add_breadcrumb("generic_insert_bulk"))?;
+        let tx_conn = tx_guard.as_mut().ok_or_else(|| {
+            BridgeOrmError::Validation(
+                "Transaction already closed".to_string(),
+                DiagnosticInfo::default(),
+            )
+        })?;
+        query.execute(&mut **tx_conn).await.map_err(|e| {
+            BridgeOrmError::from(e)
+                .with_sql(sql.clone(), None)
+                .add_breadcrumb("generic_insert_bulk")
+        })?;
     } else {
-        query
-            .execute(pool)
-            .await
-            .map_err(|e| BridgeOrmError::from(e).with_sql(sql.clone(), None).add_breadcrumb("generic_insert_bulk"))?;
+        query.execute(pool).await.map_err(|e| {
+            BridgeOrmError::from(e)
+                .with_sql(sql.clone(), None)
+                .add_breadcrumb("generic_insert_bulk")
+        })?;
     }
 
     let duration = start.elapsed();
@@ -463,7 +651,7 @@ pub async fn generic_query(
     for col in &columns {
         validate_identifier(col)?;
     }
-    
+
     let filter_vec: Vec<(String, QueryValue)> = filters.into_iter().collect();
     for (col, _) in &filter_vec {
         validate_identifier(col)?;
@@ -471,42 +659,49 @@ pub async fn generic_query(
 
     let (sql, values) = dialect.build_select(table_name, &columns, &filter_vec, limit);
 
-    let start = Instant::now();
-    let mut query = sqlx::query(&sql);
-    for val in &values {
-        query = bind_query_value(query, val);
-    }
+    CIRCUIT_BREAKER
+        .call(|| async {
+            let start = Instant::now();
+            let mut query = sqlx::query(&sql);
+            for val in &values {
+                query = bind_query_value(query, val);
+            }
 
-    let rows = if let Some(tx_mutex) = tx {
-        let mut tx_guard = tx_mutex.lock().await;
-        let tx_conn = tx_guard
-            .as_mut()
-            .ok_or_else(|| {
-                BridgeOrmError::Validation("Transaction already closed".to_string(), DiagnosticInfo::default())
-            })?;
-        query
-            .fetch_all(&mut **tx_conn)
-            .await
-            .map_err(|e| BridgeOrmError::from(e).with_sql(sql.clone(), None).add_breadcrumb("generic_query"))?
-    } else {
-        query
-            .fetch_all(pool)
-            .await
-            .map_err(|e| BridgeOrmError::from(e).with_sql(sql.clone(), None).add_breadcrumb("generic_query"))?
-    };
+            let rows = if let Some(tx_mutex) = tx {
+                let mut tx_guard = tx_mutex.lock().await;
+                let tx_conn = tx_guard.as_mut().ok_or_else(|| {
+                    BridgeOrmError::Validation(
+                        "Transaction already closed".to_string(),
+                        DiagnosticInfo::default(),
+                    )
+                })?;
+                query.fetch_all(&mut **tx_conn).await.map_err(|e| {
+                    BridgeOrmError::from(e)
+                        .with_sql(sql.clone(), None)
+                        .add_breadcrumb("generic_query")
+                })?
+            } else {
+                query.fetch_all(pool).await.map_err(|e| {
+                    BridgeOrmError::from(e)
+                        .with_sql(sql.clone(), None)
+                        .add_breadcrumb("generic_query")
+                })?
+            };
 
-    let duration = start.elapsed();
-    logger::emit_telemetry(TelemetryEvent {
-        sql: sql.clone(),
-        duration_micros: duration.as_micros() as u64,
-        operation: "SELECT".to_string(),
-        table: table_name.to_string(),
-    });
+            let duration = start.elapsed();
+            logger::emit_telemetry(TelemetryEvent {
+                sql: sql.clone(),
+                duration_micros: duration.as_micros() as u64,
+                operation: "SELECT".to_string(),
+                table: table_name.to_string(),
+            });
 
-    Ok(rows)
+            Ok(rows)
+        })
+        .await
 }
 
-/// Pure Rust implementation of lazy query.
+/// Rust implementation of lazy query.
 #[must_use]
 #[tracing::instrument(skip(pool, tx))]
 pub fn query_lazy(
@@ -524,7 +719,7 @@ pub fn query_lazy(
 
     let columns = fields.unwrap_or_default();
     let filter_vec: Vec<(String, QueryValue)> = filters.into_iter().collect();
-    
+
     let (sql, values) = dialect.build_select(table_name, &columns, &filter_vec, limit);
 
     let pool_clone = pool.clone();
@@ -536,20 +731,23 @@ pub fn query_lazy(
 
         if let Some(tx_mutex) = tx {
             let mut tx_guard = tx_mutex.lock().await;
-            let tx_conn = tx_guard
-                .as_mut()
-                .ok_or_else(|| {
-                    BridgeOrmError::Validation("Transaction already closed".to_string(), DiagnosticInfo::default())
-                })?; 
-            query
-                .fetch_all(&mut **tx_conn)
-                .await
-                .map_err(|e| BridgeOrmError::from(e).with_sql(sql.clone(), None).add_breadcrumb("query_lazy"))
+            let tx_conn = tx_guard.as_mut().ok_or_else(|| {
+                BridgeOrmError::Validation(
+                    "Transaction already closed".to_string(),
+                    DiagnosticInfo::default(),
+                )
+            })?;
+            query.fetch_all(&mut **tx_conn).await.map_err(|e| {
+                BridgeOrmError::from(e)
+                    .with_sql(sql.clone(), None)
+                    .add_breadcrumb("query_lazy")
+            })
         } else {
-            query
-                .fetch_all(&pool_clone)
-                .await
-                .map_err(|e| BridgeOrmError::from(e).with_sql(sql.clone(), None).add_breadcrumb("query_lazy"))
+            query.fetch_all(&pool_clone).await.map_err(|e| {
+                BridgeOrmError::from(e)
+                    .with_sql(sql.clone(), None)
+                    .add_breadcrumb("query_lazy")
+            })
         }
     })
     .flat_map(|res| match res {

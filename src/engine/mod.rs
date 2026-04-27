@@ -8,3 +8,4 @@ pub mod hydrator;
 pub mod dirty_tracker;
 pub mod relations;
 pub mod loader;
+pub mod circuit_breaker;

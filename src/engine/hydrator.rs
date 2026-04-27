@@ -1,46 +1,62 @@
-use sqlx::{any::AnyRow, Column, Row};
-use std::collections::HashMap;
+use crate::engine::metadata::{ColumnMetadata, REGISTRY};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
-use crate::engine::metadata::{REGISTRY, ColumnMetadata};
+use sqlx::{any::AnyRow, Column, Row};
+use std::collections::HashMap;
 
-pub fn hydrate_row<'py>(py: Python<'py>, table_name: &str, row: &AnyRow) -> PyResult<Bound<'py, PyDict>> {
+pub fn hydrate_row<'py>(
+    py: Python<'py>,
+    table_name: &str,
+    row: &AnyRow,
+) -> PyResult<Bound<'py, PyDict>> {
     let registry_guard = REGISTRY.read().unwrap();
     let mapping = registry_guard.mappings.get(table_name);
-    
+
     if mapping.is_none() {
         println!("DEBUG: No mapping found for table: {}", table_name);
-        println!("DEBUG: Available mappings: {:?}", registry_guard.mappings.keys());
+        println!(
+            "DEBUG: Available mappings: {:?}",
+            registry_guard.mappings.keys()
+        );
     }
-    
+
     let dict = PyDict::new_bound(py);
-    
+
     for column in row.columns() {
         let name = column.name();
         let meta = mapping.and_then(|m| m.columns.get(name));
-        
-        println!("DEBUG: Hydrating column: {} (has_meta: {})", name, meta.is_some());
+
+        println!(
+            "DEBUG: Hydrating column: {} (has_meta: {})",
+            name,
+            meta.is_some()
+        );
         if let Some(m) = meta {
             println!("DEBUG:   Meta data_type: {}", m.data_type);
         }
-        
+
         let val = if let Some(meta) = meta {
             coerce_value(py, row, name, meta)?
         } else {
-            // Fallback for unmapped columns (lenient mode by default)
+            // Fallback for unmapped columns
             let raw_val: String = row.try_get(name).unwrap_or_default();
             raw_val.to_object(py)
         };
-        
+
         dict.set_item(name, val)?;
     }
-    
+
     Ok(dict)
 }
 
-fn coerce_value(py: Python<'_>, row: &AnyRow, name: &str, meta: &ColumnMetadata) -> PyResult<PyObject> {
+fn coerce_value(
+    py: Python<'_>,
+    row: &AnyRow,
+    name: &str,
+    meta: &ColumnMetadata,
+) -> PyResult<PyObject> {
     // Basic type coercion based on metadata data_type.
-    
+
     match meta.data_type.to_lowercase().as_str() {
         "text" | "str" | "string" => {
             if let Ok(val) = row.try_get::<String, _>(name) {
@@ -76,43 +92,46 @@ fn coerce_value(py: Python<'_>, row: &AnyRow, name: &str, meta: &ColumnMetadata)
         }
         "int" | "bigint" | "integer" => {
             if let Ok(val) = row.try_get::<i64, _>(name) {
-                 Ok(val.to_object(py))
+                Ok(val.to_object(py))
             } else if let Ok(val_str) = row.try_get::<String, _>(name) {
-                 let val: i64 = val_str.parse().unwrap_or(0);
-                 Ok(val.to_object(py))
+                let val: i64 = val_str.parse().unwrap_or(0);
+                Ok(val.to_object(py))
             } else {
-                 Ok(py.None())
+                Ok(py.None())
             }
         }
         "bool" | "boolean" => {
             if let Ok(val) = row.try_get::<bool, _>(name) {
-                 Ok(val.to_object(py))
+                Ok(val.to_object(py))
             } else if let Ok(val_i) = row.try_get::<i32, _>(name) {
-                 Ok((val_i != 0).to_object(py))
+                Ok((val_i != 0).to_object(py))
             } else if let Ok(val_i) = row.try_get::<i64, _>(name) {
-                 Ok((val_i != 0).to_object(py))
+                Ok((val_i != 0).to_object(py))
             } else if let Ok(val_s) = row.try_get::<String, _>(name) {
-                 let normalized = val_s.to_lowercase();
-                 let val = normalized == "true" || normalized == "1" || normalized == "t";
-                 Ok(val.to_object(py))
+                let normalized = val_s.to_lowercase();
+                let val = normalized == "true" || normalized == "1" || normalized == "t";
+                Ok(val.to_object(py))
             } else {
-                 Ok(py.None())
+                Ok(py.None())
             }
         }
         "float" | "double" | "real" => {
             if let Ok(val) = row.try_get::<f64, _>(name) {
-                 Ok(val.to_object(py))
+                Ok(val.to_object(py))
             } else if let Ok(val_str) = row.try_get::<String, _>(name) {
-                 let val: f64 = val_str.parse().unwrap_or(0.0);
-                 Ok(val.to_object(py))
+                let val: f64 = val_str.parse().unwrap_or(0.0);
+                Ok(val.to_object(py))
             } else {
-                 Ok(py.None())
+                Ok(py.None())
             }
         }
         "json" | "jsonb" => {
             if let Ok(val_str) = row.try_get::<String, _>(name) {
                 let json_module = py.import_bound("json").unwrap();
-                Ok(json_module.call_method1("loads", (val_str,)).unwrap().to_object(py))
+                Ok(json_module
+                    .call_method1("loads", (val_str,))
+                    .unwrap()
+                    .to_object(py))
             } else {
                 Ok(py.None())
             }
