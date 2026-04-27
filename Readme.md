@@ -1,3 +1,5 @@
+<div align="center">
+
 # BridgeORM
 
 [![Performance: Native FFI](https://img.shields.io/badge/Performance-Native_FFI-red.svg)](#architecture)
@@ -6,7 +8,9 @@
 [![Reliability: Circuit_Breaker](https://img.shields.io/badge/Reliability-Circuit_Breaker-gold.svg)](#security-mandate)
 [![Observability: OpenTelemetry](https://img.shields.io/badge/Observability-OpenTelemetry-blueviolet.svg)](#architecture)
 
-**BridgeORM** is a cross-language ORM (Rust+Python). It is lightweight, secure by defaul.
+**BridgeORM** is a cross-language ORM (Rust+Python). It is lightweight, secure by default.
+
+</div>
 
 ---
 
