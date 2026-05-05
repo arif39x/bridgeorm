@@ -1,9 +1,29 @@
+#[macro_export]
+macro_rules! ffi_guard {
+    ($py:expr, $body:expr) => {
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| $body)).unwrap_or_else(|e| {
+            let msg = if let Some(s) = e.downcast_ref::<&str>() {
+                s.to_string()
+            } else if let Some(s) = e.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "Unknown Rust panic".to_string()
+            };
+            Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "Rust panic: {}",
+                msg
+            )))
+        })
+    };
+}
+
 use crate::engine;
 use crate::error::{BridgeOrmError, BridgeOrmResult};
 use crate::schema;
 use crate::telemetry;
 pub mod java;
 pub mod pool_config;
+pub mod type_coercion;
 use futures::stream::BoxStream;
 use futures::StreamExt;
 use once_cell::sync::Lazy;
@@ -11,8 +31,8 @@ use pyo3::exceptions::{
     PyException, PyKeyError, PyRuntimeError, PyStopAsyncIteration, PyValueError,
 };
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyBytes};
-use sqlx::{any::AnyRow, AnyPool, Column, Row};
+use pyo3::types::{PyBytes, PyDict};
+use sqlx::{any::AnyRow, AnyPool};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -50,19 +70,28 @@ fn query_value_to_py(py: Python<'_>, v: QueryValue) -> PyObject {
         QueryValue::DateTime(dt) => {
             let datetime_module = py.import_bound("datetime").unwrap();
             let datetime_cls = datetime_module.getattr("datetime").unwrap();
-            let dt_obj = datetime_cls.call_method1("fromisoformat", (dt.to_rfc3339(),)).unwrap();
+            let dt_obj = datetime_cls
+                .call_method1("fromisoformat", (dt.to_rfc3339(),))
+                .unwrap();
             dt_obj.to_object(py)
         }
         QueryValue::Json(j) => {
             let s = j.to_string();
             let json_module = py.import_bound("json").unwrap();
-            json_module.call_method1("loads", (s,)).unwrap().to_object(py)
+            json_module
+                .call_method1("loads", (s,))
+                .unwrap()
+                .to_object(py)
         }
         QueryValue::Bytes(b) => b.to_object(py),
         QueryValue::Raw(raw) => {
             let dict = PyDict::new_bound(py);
             dict.set_item("sql", raw.sql).unwrap();
-            let params: Vec<PyObject> = raw.params.into_iter().map(|p| query_value_to_py(py, p)).collect();
+            let params: Vec<PyObject> = raw
+                .params
+                .into_iter()
+                .map(|p| query_value_to_py(py, p))
+                .collect();
             dict.set_item("params", params).unwrap();
             dict.to_object(py)
         }
@@ -70,13 +99,20 @@ fn query_value_to_py(py: Python<'_>, v: QueryValue) -> PyObject {
     }
 }
 
-fn py_to_query_value(py: Python<'_>, obj: &Bound<'_, PyAny>, table_name: &str, column_name: &str) -> BridgeOrmResult<QueryValue> {
+fn py_to_query_value(
+    py: Python<'_>,
+    obj: &Bound<'_, PyAny>,
+    table_name: &str,
+    column_name: &str,
+) -> BridgeOrmResult<QueryValue> {
     if obj.is_none() {
         return Ok(QueryValue::Null);
     }
 
     let registry_guard = engine::metadata::REGISTRY.read().unwrap();
-    let meta = registry_guard.mappings.get(table_name)
+    let meta = registry_guard
+        .mappings
+        .get(table_name)
         .and_then(|m| m.columns.get(column_name));
 
     if let Some(m) = meta {
@@ -87,7 +123,7 @@ fn py_to_query_value(py: Python<'_>, obj: &Bound<'_, PyAny>, table_name: &str, c
     if let Ok(b) = obj.extract::<bool>() {
         // In Python, bool is a subclass of int, so check bool first.
         if obj.is_instance_of::<pyo3::types::PyBool>() {
-             return Ok(QueryValue::Bool(b));
+            return Ok(QueryValue::Bool(b));
         }
     }
 
@@ -103,11 +139,14 @@ fn py_to_query_value(py: Python<'_>, obj: &Bound<'_, PyAny>, table_name: &str, c
     if let Ok(u) = uuid::Uuid::parse_str(&obj.to_string()) {
         // Basic check to avoid false positives with random strings
         if !obj.is_instance_of::<pyo3::types::PyString>() {
-             return Ok(QueryValue::Uuid(u));
+            return Ok(QueryValue::Uuid(u));
         }
     }
 
-    if let Ok(s) = obj.call_method0("isoformat").and_then(|r| r.extract::<String>()) {
+    if let Ok(s) = obj
+        .call_method0("isoformat")
+        .and_then(|r| r.extract::<String>())
+    {
         if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(&s) {
             return Ok(QueryValue::DateTime(dt.with_timezone(&chrono::Utc)));
         }
@@ -126,7 +165,10 @@ fn py_to_query_value(py: Python<'_>, obj: &Bound<'_, PyAny>, table_name: &str, c
                     for p in params_py {
                         params.push(py_to_query_value(py, &p, table_name, column_name)?);
                     }
-                    return Ok(QueryValue::Raw(crate::engine::query::RawExpression { sql, params }));
+                    return Ok(QueryValue::Raw(crate::engine::query::RawExpression {
+                        sql,
+                        params,
+                    }));
                 }
             }
         }
@@ -192,7 +234,11 @@ fn configure_logging(level: String, slow_query_ms: u64) -> PyResult<()> {
 
 #[pyfunction]
 #[pyo3(signature = (url, config=None))]
-fn connect(py: Python<'_>, url: String, config: Option<pool_config::PoolConfig>) -> PyResult<Bound<'_, PyAny>> {
+fn connect(
+    py: Python<'_>,
+    url: String,
+    config: Option<pool_config::PoolConfig>,
+) -> PyResult<Bound<'_, PyAny>> {
     let url_clone = url.clone();
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let pool = engine::db::connect(&url_clone, config)
@@ -320,7 +366,9 @@ fn insert_row<'py>(
         } else if let Ok(tx_handle) = tx_obj.extract::<engine::transaction::TxHandle>(py) {
             Some(tx_handle.inner)
         } else {
-            return Err(PyValueError::new_err("Invalid transaction or session object"));
+            return Err(PyValueError::new_err(
+                "Invalid transaction or session object",
+            ));
         }
     } else {
         None
@@ -330,19 +378,16 @@ fn insert_row<'py>(
     let mut query_data: HashMap<String, QueryValue> = HashMap::new();
     for (k, v) in data {
         let key = k.extract::<String>()?;
-        query_data.insert(key.clone(), py_to_query_value(py, &v, &table_clone, &key));
+        query_data.insert(
+            key.clone(),
+            py_to_query_value(py, &v, &table_clone, &key).map_err(bridge_error_to_py)?,
+        );
     }
 
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let res = engine::db::generic_insert(
-            &pool,
-            tx_mutex.as_ref(),
-            &url,
-            &table,
-            query_data,
-        )
-        .await
-        .map_err(bridge_error_to_py)?;
+        let res = engine::db::generic_insert(&pool, tx_mutex.as_ref(), &url, &table, query_data)
+            .await
+            .map_err(bridge_error_to_py)?;
 
         Python::with_gil(|py| {
             let dict = PyDict::new_bound(py);
@@ -383,7 +428,9 @@ fn find_one<'py>(
             } else if let Ok(tx_handle) = tx_obj.extract::<engine::transaction::TxHandle>(py) {
                 Some(tx_handle.inner)
             } else {
-                return Err(PyValueError::new_err("Invalid transaction or session object"));
+                return Err(PyValueError::new_err(
+                    "Invalid transaction or session object",
+                ));
             }
         } else {
             None
@@ -393,7 +440,10 @@ fn find_one<'py>(
         let mut query_filters: HashMap<String, QueryValue> = HashMap::new();
         for (k, v) in filters {
             let key = k.extract::<String>()?;
-            query_filters.insert(key.clone(), py_to_query_value(py, &v, &table_clone, &key).map_err(bridge_error_to_py)?);
+            query_filters.insert(
+                key.clone(),
+                py_to_query_value(py, &v, &table_clone, &key).map_err(bridge_error_to_py)?,
+            );
         }
 
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -421,6 +471,7 @@ fn find_one<'py>(
     })
 }
 
+#[cfg(feature = "data-science")]
 #[pyfunction]
 #[pyo3(signature = (table, filters, limit=None, fields=None, tx=None))]
 fn fetch_all_arrow<'py>(
@@ -448,7 +499,9 @@ fn fetch_all_arrow<'py>(
         } else if let Ok(tx_handle) = tx_obj.extract::<engine::transaction::TxHandle>(py) {
             Some(tx_handle.inner)
         } else {
-            return Err(PyValueError::new_err("Invalid transaction or session object"));
+            return Err(PyValueError::new_err(
+                "Invalid transaction or session object",
+            ));
         }
     } else {
         None
@@ -458,7 +511,10 @@ fn fetch_all_arrow<'py>(
     let mut query_filters: HashMap<String, QueryValue> = HashMap::new();
     for (k, v) in filters {
         let key = k.extract::<String>()?;
-        query_filters.insert(key.clone(), py_to_query_value(py, &v, &table_clone, &key));
+        query_filters.insert(
+            key.clone(),
+            py_to_query_value(py, &v, &table_clone, &key).map_err(bridge_error_to_py)?,
+        );
     }
 
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -477,20 +533,21 @@ fn fetch_all_arrow<'py>(
         let buffer = engine::arrow::rows_to_arrow_ipc(&table, &rows).map_err(bridge_error_to_py)?;
 
         Python::with_gil(|py| {
-             let bytes = PyBytes::new_bound(py, &buffer);
-             Ok(bytes.to_object(py))
+            let bytes = PyBytes::new_bound(py, &buffer);
+            Ok(bytes.to_object(py))
         })
     })
 }
 
 #[pyfunction]
-#[pyo3(signature = (table, filters, limit=None, fields=None, tx=None))]
+#[pyo3(signature = (table, filters, limit=None, fields=None, eager_loads=None, tx=None))]
 fn fetch_all<'py>(
     py: Python<'py>,
     table: String,
     filters: Bound<'py, PyDict>,
     limit: Option<i64>,
     fields: Option<Vec<String>>,
+    eager_loads: Option<Vec<Bound<'py, PyDict>>>,
     tx: Option<PyObject>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let pool_guard = POOL.read().unwrap();
@@ -512,7 +569,9 @@ fn fetch_all<'py>(
         } else if let Ok(tx_handle) = tx_obj.extract::<engine::transaction::TxHandle>(py) {
             Some(tx_handle.inner)
         } else {
-            return Err(PyValueError::new_err("Invalid transaction or session object"));
+            return Err(PyValueError::new_err(
+                "Invalid transaction or session object",
+            ));
         }
     } else {
         None
@@ -522,7 +581,10 @@ fn fetch_all<'py>(
     let mut query_filters: HashMap<String, QueryValue> = HashMap::new();
     for (k, v) in filters {
         let key = k.extract::<String>()?;
-        query_filters.insert(key.clone(), py_to_query_value(py, &v, &table_clone, &key));
+        query_filters.insert(
+            key.clone(),
+            py_to_query_value(py, &v, &table_clone, &key).map_err(bridge_error_to_py)?,
+        );
     }
 
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -577,7 +639,9 @@ fn fetch_lazy(
             } else if let Ok(tx_handle) = tx_obj.extract::<engine::transaction::TxHandle>(py) {
                 Some(tx_handle.inner)
             } else {
-                return Err(PyValueError::new_err("Invalid transaction or session object"));
+                return Err(PyValueError::new_err(
+                    "Invalid transaction or session object",
+                ));
             }
         } else {
             None
@@ -587,11 +651,15 @@ fn fetch_lazy(
         let mut query_filters: HashMap<String, QueryValue> = HashMap::new();
         for (k, v) in filters {
             let key = k.extract::<String>()?;
-            query_filters.insert(key.clone(), py_to_query_value(py, &v, &table_clone, &key).map_err(bridge_error_to_py)?);
+            query_filters.insert(
+                key.clone(),
+                py_to_query_value(py, &v, &table_clone, &key).map_err(bridge_error_to_py)?,
+            );
         }
 
-        let stream = engine::db::query_lazy(pool, tx_mutex, url, &table, query_filters, limit, fields)
-            .map_err(bridge_error_to_py)?;
+        let stream =
+            engine::db::query_lazy(pool, tx_mutex, url, &table, query_filters, limit, fields)
+                .map_err(bridge_error_to_py)?;
 
         Ok(LazyRowStream {
             stream: Arc::new(Mutex::new(stream)),
@@ -653,7 +721,9 @@ fn insert_rows_bulk<'py>(
         } else if let Ok(tx_handle) = tx_obj.extract::<engine::transaction::TxHandle>(py) {
             Some(tx_handle.inner)
         } else {
-            return Err(PyValueError::new_err("Invalid transaction or session object"));
+            return Err(PyValueError::new_err(
+                "Invalid transaction or session object",
+            ));
         }
     } else {
         None
@@ -665,21 +735,19 @@ fn insert_rows_bulk<'py>(
         let mut query_item = HashMap::new();
         for (k, v) in item {
             let key = k.extract::<String>()?;
-            query_item.insert(key.clone(), py_to_query_value(py, &v, &table_clone, &key));
+            query_item.insert(
+                key.clone(),
+                py_to_query_value(py, &v, &table_clone, &key).map_err(bridge_error_to_py)?,
+            );
         }
         query_items.push(query_item);
     }
 
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let res = engine::db::generic_insert_bulk(
-            &pool,
-            tx_mutex.as_ref(),
-            &url,
-            &table,
-            query_items,
-        )
-        .await
-        .map_err(bridge_error_to_py)?;
+        let res =
+            engine::db::generic_insert_bulk(&pool, tx_mutex.as_ref(), &url, &table, query_items)
+                .await
+                .map_err(bridge_error_to_py)?;
 
         Python::with_gil(|py| {
             let mut results = Vec::new();
@@ -723,7 +791,9 @@ fn fetch_one_to_many(
         } else if let Ok(tx_handle) = tx_obj.extract::<engine::transaction::TxHandle>(py) {
             Some(tx_handle.inner)
         } else {
-            return Err(PyValueError::new_err("Invalid transaction or session object"));
+            return Err(PyValueError::new_err(
+                "Invalid transaction or session object",
+            ));
         }
     } else {
         None
@@ -782,7 +852,9 @@ fn fetch_many_to_many(
         } else if let Ok(tx_handle) = tx_obj.extract::<engine::transaction::TxHandle>(py) {
             Some(tx_handle.inner)
         } else {
-            return Err(PyValueError::new_err("Invalid transaction or session object"));
+            return Err(PyValueError::new_err(
+                "Invalid transaction or session object",
+            ));
         }
     } else {
         None
@@ -841,7 +913,9 @@ fn fetch_self_ref(
         } else if let Ok(tx_handle) = tx_obj.extract::<engine::transaction::TxHandle>(py) {
             Some(tx_handle.inner)
         } else {
-            return Err(PyValueError::new_err("Invalid transaction or session object"));
+            return Err(PyValueError::new_err(
+                "Invalid transaction or session object",
+            ));
         }
     } else {
         None
@@ -913,7 +987,10 @@ fn snapshot_entity(
     let mut query_values = HashMap::new();
     for (k, v) in values {
         let key = k.extract::<String>()?;
-        query_values.insert(key.clone(), py_to_query_value(py, &v, &table_name, &key));
+        query_values.insert(
+            key.clone(),
+            py_to_query_value(py, &v, &table_name, &key).map_err(bridge_error_to_py)?,
+        );
     }
     session.snapshot_entity_internal(key, table_name, query_values)
 }
@@ -950,19 +1027,30 @@ fn flush<'py>(
 
         let mut jobs = Vec::new();
         {
-            let tracker_guard = session.dirty_tracker.lock().map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
+            let tracker_guard = session
+                .dirty_tracker
+                .lock()
+                .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
             for (key, table_name, current_values_py, pk_filters_py) in dirty_entities {
                 let mut current_values = HashMap::new();
                 for (k, v) in current_values_py {
                     let col_name = k.extract::<String>()?;
-                    current_values.insert(col_name.clone(), py_to_query_value(py, &v, &table_name, &col_name).map_err(bridge_error_to_py)?);
+                    current_values.insert(
+                        col_name.clone(),
+                        py_to_query_value(py, &v, &table_name, &col_name)
+                            .map_err(bridge_error_to_py)?,
+                    );
                 }
 
                 if let Some(diff) = tracker_guard.compute_diff(&key, &current_values) {
                     let mut pk_filters = HashMap::new();
                     for (k, v) in pk_filters_py {
                         let col_name = k.extract::<String>()?;
-                        pk_filters.insert(col_name.clone(), py_to_query_value(py, &v, &table_name, &col_name).map_err(bridge_error_to_py)?);
+                        pk_filters.insert(
+                            col_name.clone(),
+                            py_to_query_value(py, &v, &table_name, &col_name)
+                                .map_err(bridge_error_to_py)?,
+                        );
                     }
 
                     jobs.push(UpdateJob {
@@ -984,11 +1072,16 @@ fn flush<'py>(
                     &url,
                     &job.table_name,
                     job.diff,
-                    job.pk_filters
-                ).await.map_err(bridge_error_to_py)?;
+                    job.pk_filters,
+                )
+                .await
+                .map_err(bridge_error_to_py)?;
 
                 // Re-acquire lock to update snapshot
-                let mut tracker_guard = session.dirty_tracker.lock().map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
+                let mut tracker_guard = session
+                    .dirty_tracker
+                    .lock()
+                    .map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
                 tracker_guard.take_snapshot(job.key, job.table_name, job.full_values);
             }
             Ok(())
@@ -1013,6 +1106,7 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(insert_rows_bulk, m)?)?;
     m.add_function(wrap_pyfunction!(find_one, m)?)?;
     m.add_function(wrap_pyfunction!(fetch_all, m)?)?;
+    #[cfg(feature = "data-science")]
     m.add_function(wrap_pyfunction!(fetch_all_arrow, m)?)?;
     m.add_function(wrap_pyfunction!(fetch_lazy, m)?)?;
     m.add_function(wrap_pyfunction!(snapshot_entity, m)?)?;
@@ -1024,71 +1118,5 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(resolve_type, m)?)?;
     m.add_function(wrap_pyfunction!(engine::metadata::register_entity, m)?)?;
     m.add_function(wrap_pyfunction!(engine::metadata::lock_registry, m)?)?;
-    Ok(())
-}
-alue(py, &v, &table_name, &col_name));
-                }
-
-                jobs.push(UpdateJob {
-                    table_name,
-                    diff,
-                    pk_filters,
-                    key,
-                    full_values: current_values,
-                });
-            }
-        }
-    }
-
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        for job in jobs {
-            engine::db::generic_update(
-                &pool,
-                Some(&session.transaction),
-                &url,
-                &job.table_name,
-                job.diff,
-                job.pk_filters
-            ).await.map_err(bridge_error_to_py)?;
-
-            // Re-acquire lock to update snapshot
-            let mut tracker_guard = session.dirty_tracker.lock().map_err(|e| PyRuntimeError::new_err(format!("Lock poisoned: {}", e)))?;
-            tracker_guard.take_snapshot(job.key, job.table_name, job.full_values);
-        }
-        Ok(())
-    })
-}
-
-pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<ColumnMetaProxy>()?;
-    m.add_class::<TableMetaProxy>()?;
-    m.add_class::<LazyRowStream>()?;
-    m.add_class::<engine::transaction::TxHandle>()?;
-    m.add_class::<engine::session::Session>()?;
-    m.add_function(wrap_pyfunction!(set_telemetry_logger, m)?)?;
-    m.add_function(wrap_pyfunction!(configure_logging, m)?)?;
-    m.add_function(wrap_pyfunction!(connect, m)?)?;
-    m.add_function(wrap_pyfunction!(reflect_schema, m)?)?;
-    m.add_function(wrap_pyfunction!(reflect_table, m)?)?;
-
-    m.add_function(wrap_pyfunction!(begin_session, m)?)?;
-    m.add_function(wrap_pyfunction!(insert_row, m)?)?;
-    m.add_function(wrap_pyfunction!(insert_rows_bulk, m)?)?;
-    m.add_function(wrap_pyfunction!(find_one, m)?)?;
-    m.add_function(wrap_pyfunction!(fetch_all, m)?)?;
-    m.add_function(wrap_pyfunction!(fetch_all_arrow, m)?)?;
-    m.add_function(wrap_pyfunction!(fetch_lazy, m)?)?;
-    m.add_function(wrap_pyfunction!(snapshot_entity, m)?)?;
-    m.add_function(wrap_pyfunction!(flush, m)?)?;
-    m.add_function(wrap_pyfunction!(fetch_one_to_many, m)?)?;
-    m.add_function(wrap_pyfunction!(fetch_many_to_many, m)?)?;
-    m.add_function(wrap_pyfunction!(fetch_self_ref, m)?)?;
-    m.add_function(wrap_pyfunction!(execute_raw, m)?)?;
-    m.add_function(wrap_pyfunction!(resolve_type, m)?)?;
-    m.add_function(wrap_pyfunction!(engine::metadata::register_entity, m)?)?;
-    m.add_function(wrap_pyfunction!(engine::metadata::lock_registry, m)?)?;
-    Ok(())
-}
-n(wrap_pyfunction!(engine::metadata::lock_registry, m)?)?;
     Ok(())
 }

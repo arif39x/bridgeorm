@@ -12,7 +12,7 @@ async fn main() {
         .execute(&pool)
         .await
         .unwrap();
-        
+
     let columns = vec![
         ("id".to_string(), "str".to_string(), false, true),
         ("username".to_string(), "str".to_string(), false, false),
@@ -37,7 +37,9 @@ async fn main() {
 
     let start = Instant::now();
     let filters = HashMap::new();
-    let rows = generic_query(&pool, None, url, "users", filters, Some(count as i64), None).await.unwrap();
+    let rows = generic_query(&pool, None, url, "users", filters, Some(count as i64), None)
+        .await
+        .unwrap();
     let duration = start.elapsed();
 
     println!("Fetched {} rows in Rust in {:?}", rows.len(), duration);

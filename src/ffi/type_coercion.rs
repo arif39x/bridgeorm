@@ -37,7 +37,7 @@ pub fn coerce_py_value(
                         py_val
                             .get_type()
                             .name()
-                            .unwrap_or("unknown")
+                            .unwrap_or(std::borrow::Cow::Borrowed("unknown"))
                             .to_string()
                             .as_str(),
                     )

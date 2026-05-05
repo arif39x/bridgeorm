@@ -1,4 +1,4 @@
-use sqlx::{AnyPool, Row}; // every query in this file uses bound parameters
+use sqlx::AnyPool; // every query in this file uses bound parameters
 use std::collections::HashMap;
 use uuid::Uuid;
 

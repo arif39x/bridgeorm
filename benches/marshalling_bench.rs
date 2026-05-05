@@ -1,9 +1,9 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use bridge_orm::engine::db::{connect, generic_query};
 use bridge_orm::engine::metadata::register_entity;
+use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use sqlx::AnyPool;
 use std::collections::HashMap;
 use tokio::runtime::Runtime;
-use sqlx::AnyPool;
 
 async fn setup_rows(pool: &AnyPool, count: usize) {
     for i in 0..count {
@@ -22,14 +22,14 @@ async fn setup_rows(pool: &AnyPool, count: usize) {
 fn bench_rust_query(c: &mut Criterion) {
     let rt = Runtime::new().unwrap();
     let url = "sqlite::memory:";
-    
+
     rt.block_on(async {
         let pool = connect(url).await.unwrap();
         sqlx::query("CREATE TABLE users (id TEXT PRIMARY KEY, username TEXT, email TEXT, created_at TEXT, updated_at TEXT)")
             .execute(&pool)
             .await
             .unwrap();
-            
+
         // Register entity
         let columns = vec![
             ("id".to_string(), "str".to_string(), false, true),
@@ -51,11 +51,11 @@ fn bench_rust_query(c: &mut Criterion) {
                 black_box(rows);
             });
         });
-        
+
         // 10000 rows
         sqlx::query("DELETE FROM users").execute(&pool).await.unwrap();
         setup_rows(&pool, 10000).await;
-        
+
         let pool_10000 = pool.clone();
         c.bench_function("rust_fetch_10000", |b| {
             b.to_async(&rt).iter(|| async {

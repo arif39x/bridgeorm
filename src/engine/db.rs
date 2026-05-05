@@ -5,7 +5,8 @@ use futures::stream::BoxStream;
 use futures::StreamExt;
 use once_cell::sync::Lazy;
 use regex::Regex;
-use sqlx::{any::AnyRow, AnyPool, Column, Row};
+use sqlx::any::{AnyConnectOptions, AnyRow};
+use sqlx::AnyPool;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
@@ -276,7 +277,9 @@ pub async fn connect(
 ) -> BridgeOrmResult<AnyPool> {
     sqlx::any::install_default_drivers();
 
-    let mut options = sqlx::any::AnyConnectOptions::from_url(url).map_err(BridgeOrmError::from)?;
+    let mut options = url
+        .parse::<AnyConnectOptions>()
+        .map_err(BridgeOrmError::from)?;
 
     let mut pool_builder = sqlx::any::AnyPoolOptions::new();
 

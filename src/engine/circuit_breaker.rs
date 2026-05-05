@@ -1,6 +1,6 @@
+use crate::error::{BridgeOrmError, DiagnosticInfo};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use crate::error::{BridgeOrmError, DiagnosticInfo};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum State {
@@ -73,18 +73,16 @@ impl CircuitBreaker {
                 state.current_state = State::Closed;
                 state.last_failure_time = None;
             }
-            Err(e) => {
-                match e {
-                    BridgeOrmError::Database(_, _) | BridgeOrmError::Internal(_, _) => {
-                        state.failures += 1;
-                        state.last_failure_time = Some(Instant::now());
-                        if state.failures >= self.max_failures {
-                            state.current_state = State::Open;
-                        }
+            Err(e) => match e {
+                BridgeOrmError::Database(_, _) | BridgeOrmError::Internal(_, _) => {
+                    state.failures += 1;
+                    state.last_failure_time = Some(Instant::now());
+                    if state.failures >= self.max_failures {
+                        state.current_state = State::Open;
                     }
-                    _ => {} 
                 }
-            }
+                _ => {}
+            },
         }
     }
 }

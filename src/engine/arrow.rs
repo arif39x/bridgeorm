@@ -1,13 +1,11 @@
-use arrow::array::{
-    ArrayRef, BooleanBuilder, Float64Builder, Int64Builder, StringBuilder,
-};
+use crate::engine::metadata::REGISTRY;
+use crate::error::BridgeOrmResult;
+use arrow::array::{ArrayRef, BooleanBuilder, Float64Builder, Int64Builder, StringBuilder};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use arrow_ipc::writer::StreamWriter;
 use sqlx::{any::AnyRow, Column, Row};
 use std::sync::Arc;
-use crate::error::BridgeOrmResult;
-use crate::engine::metadata::REGISTRY;
 
 pub fn rows_to_arrow_ipc(table_name: &str, rows: &[AnyRow]) -> BridgeOrmResult<Vec<u8>> {
     if rows.is_empty() {
@@ -16,7 +14,7 @@ pub fn rows_to_arrow_ipc(table_name: &str, rows: &[AnyRow]) -> BridgeOrmResult<V
 
     let registry_guard = REGISTRY.read().unwrap();
     let mapping = registry_guard.mappings.get(table_name);
-    
+
     let first_row = &rows[0];
     let mut fields = Vec::new();
     let mut builders: Vec<Box<dyn arrow::array::ArrayBuilder>> = Vec::new();
@@ -24,7 +22,7 @@ pub fn rows_to_arrow_ipc(table_name: &str, rows: &[AnyRow]) -> BridgeOrmResult<V
     for column in first_row.columns() {
         let name = column.name();
         let meta = mapping.and_then(|m| m.columns.get(name));
-        
+
         let data_type = if let Some(m) = meta {
             match m.data_type.to_lowercase().as_str() {
                 "int" | "bigint" | "integer" => DataType::Int64,
@@ -52,8 +50,7 @@ pub fn rows_to_arrow_ipc(table_name: &str, rows: &[AnyRow]) -> BridgeOrmResult<V
         for (i, column) in row.columns().iter().enumerate() {
             let name = column.name();
             let builder = &mut builders[i];
-            
-            // This is a bit slow but better than individual python objects
+
             if let Some(meta) = mapping.and_then(|m| m.columns.get(name)) {
                 match meta.data_type.to_lowercase().as_str() {
                     "int" | "bigint" | "integer" => {
@@ -65,7 +62,10 @@ pub fn rows_to_arrow_ipc(table_name: &str, rows: &[AnyRow]) -> BridgeOrmResult<V
                         }
                     }
                     "bool" | "boolean" => {
-                        let b = builder.as_any_mut().downcast_mut::<BooleanBuilder>().unwrap();
+                        let b = builder
+                            .as_any_mut()
+                            .downcast_mut::<BooleanBuilder>()
+                            .unwrap();
                         if let Ok(val) = row.try_get::<bool, _>(name) {
                             b.append_value(val);
                         } else {
@@ -73,7 +73,10 @@ pub fn rows_to_arrow_ipc(table_name: &str, rows: &[AnyRow]) -> BridgeOrmResult<V
                         }
                     }
                     "float" | "double" | "real" => {
-                        let b = builder.as_any_mut().downcast_mut::<Float64Builder>().unwrap();
+                        let b = builder
+                            .as_any_mut()
+                            .downcast_mut::<Float64Builder>()
+                            .unwrap();
                         if let Ok(val) = row.try_get::<f64, _>(name) {
                             b.append_value(val);
                         } else {
@@ -81,7 +84,10 @@ pub fn rows_to_arrow_ipc(table_name: &str, rows: &[AnyRow]) -> BridgeOrmResult<V
                         }
                     }
                     "uuid" | "datetime" | "timestamp" => {
-                        let b = builder.as_any_mut().downcast_mut::<StringBuilder>().unwrap();
+                        let b = builder
+                            .as_any_mut()
+                            .downcast_mut::<StringBuilder>()
+                            .unwrap();
                         if let Ok(val) = row.try_get::<String, _>(name) {
                             b.append_value(val);
                         } else {
@@ -89,7 +95,10 @@ pub fn rows_to_arrow_ipc(table_name: &str, rows: &[AnyRow]) -> BridgeOrmResult<V
                         }
                     }
                     _ => {
-                        let b = builder.as_any_mut().downcast_mut::<StringBuilder>().unwrap();
+                        let b = builder
+                            .as_any_mut()
+                            .downcast_mut::<StringBuilder>()
+                            .unwrap();
                         if let Ok(val) = row.try_get::<String, _>(name) {
                             b.append_value(val);
                         } else {
@@ -98,7 +107,10 @@ pub fn rows_to_arrow_ipc(table_name: &str, rows: &[AnyRow]) -> BridgeOrmResult<V
                     }
                 }
             } else {
-                let b = builder.as_any_mut().downcast_mut::<StringBuilder>().unwrap();
+                let b = builder
+                    .as_any_mut()
+                    .downcast_mut::<StringBuilder>()
+                    .unwrap();
                 if let Ok(val) = row.try_get::<String, _>(name) {
                     b.append_value(val);
                 } else {

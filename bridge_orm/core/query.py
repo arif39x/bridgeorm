@@ -1,8 +1,29 @@
+from dataclasses import dataclass, field
+from enum import Enum, auto
 from typing import Any, AsyncIterator, Dict, List, Optional, Type
 
 import bridge_orm_rs
 
 from ..common.exceptions import DatabaseError, ValidationError
+
+
+class EagerLoadingStrategy(Enum):
+    # WHY: Explicit enum prevents callers from passing magic strings like
+    # "joined" or "select_in" that would silently degrade to a default.
+    JOINED_FOR_TO_ONE = auto()
+    SELECT_IN_FOR_TO_MANY = auto()
+
+
+@dataclass
+class EagerLoadRequest:
+    """
+    Describes a single relation the caller wants pre-loaded.
+
+    WHY: Using a dataclass instead of a raw dict forces callers to be
+    explicit about strategy — the compiler/type-checker enforces intent.
+    """
+    relation_name: str
+    strategy: EagerLoadingStrategy
 
 
 class Raw:
@@ -18,7 +39,7 @@ class QueryBuilder:
     # Fluent interface for building and executing database queries.
     # Rule: Use __slots__ on hot-path classes.
 
-    __slots__ = ("model_class", "_filters", "_limit", "_projection")
+    __slots__ = ("model_class", "_filters", "_limit", "_projection", "_eager_load_requests")
 
     def __init__(self, model_class: Type["BaseModel"]) -> None:
 
@@ -30,6 +51,7 @@ class QueryBuilder:
         self._filters: Dict[str, Any] = {}
         self._limit: Optional[int] = None
         self._projection: Optional[List[str]] = None
+        self._eager_load_requests: List[EagerLoadRequest] = []
 
     def select(self, *fields: str) -> "QueryBuilder":
 
@@ -70,6 +92,47 @@ class QueryBuilder:
         self._limit = count
         return self
 
+    def with_relation(
+        self,
+        relation_name: str,
+        strategy: EagerLoadingStrategy,
+    ) -> "QueryBuilder":
+        """
+        Registers a relation to be eagerly loaded using the specified strategy.
+
+        WHY: Fluent API allows chaining while each call mutates only the
+        eager-load list — a single, well-scoped responsibility.
+        """
+        self._eager_load_requests.append(
+            EagerLoadRequest(
+                relation_name=relation_name,
+                strategy=strategy,
+            )
+        )
+        return self
+
+    def _build_query_ast_payload(self) -> dict:
+        """
+        Converts internal builder state to a JSON-serialisable dict that
+        the Rust Query AST compiler understands.
+
+        WHY: Isolated as a private method so it can be tested independently
+        without triggering a real database call.
+        """
+        return {
+            "table": self.model_class.table,
+            "filters": self._filters,
+            "limit": self._limit,
+            "projection": self._projection,
+            "eager_loads": [
+                {
+                    "relation_name": request.relation_name,
+                    "strategy": request.strategy.name,
+                }
+                for request in self._eager_load_requests
+            ],
+        }
+
     async def fetch(self, tx: Any = None) -> List[Any]:
         """
         Execute the query and return all results as model instances.
@@ -84,8 +147,15 @@ class QueryBuilder:
         try:
             # Handle Session or TxHandle
             rs_tx = tx._rs_session if hasattr(tx, "_rs_session") else tx
+            eager_loads_payload = [
+                {
+                    "relation_name": req.relation_name,
+                    "strategy": req.strategy.name,
+                }
+                for req in self._eager_load_requests
+            ]
             raw_results = await bridge_orm_rs.fetch_all(
-                self.model_class.table, filters, self._limit, self._projection, tx=rs_tx
+                self.model_class.table, filters, self._limit, self._projection, eager_loads_payload, tx=rs_tx
             )
             instances = []
             for res in raw_results:
