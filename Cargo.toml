@@ -31,10 +31,25 @@ opentelemetry-semantic-conventions = "0.15"
 opentelemetry-http = "0.12"
 http = "1.1"
 regex = "1"
-jni = "0.21"
 thiserror = "1.0"
-arrow = "58"
-arrow-ipc = "58"
+dashmap = "5"
+
+[dependencies.jni]
+version = "0.21"
+optional = true
+
+[dependencies.arrow]
+version = "58"
+optional = true
+
+[dependencies.arrow-ipc]
+version = "58"
+optional = true
+
+[features]
+default = []
+data-science = ["arrow", "arrow-ipc"]
+java-interop = ["jni"]
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["async_tokio"] }

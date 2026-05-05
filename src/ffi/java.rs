@@ -1,3 +1,4 @@
+#![cfg(feature = "java-interop")]
 use crate::engine;
 use jni::objects::{JClass, JString};
 use jni::sys::jstring;
@@ -21,7 +22,7 @@ pub extern "system" fn Java_io_bridgeorm_core_BridgeORM_connectNative(
         .expect("Invalid URL string from Java")
         .into();
 
-    let result = RUNTIME.block_on(async { engine::db::connect(&url_str).await });
+    let result = RUNTIME.block_on(async { engine::db::connect(&url_str, None).await });
 
     match result {
         Ok(_) => {

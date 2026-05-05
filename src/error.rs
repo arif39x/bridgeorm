@@ -1,5 +1,5 @@
-use thiserror::Error;
 use std::fmt;
+use thiserror::Error;
 
 #[derive(Debug, Clone, Default)]
 pub struct DiagnosticInfo {

@@ -17,8 +17,12 @@ impl TxHandle {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut guard = inner.lock().await;
-            let tx = guard.take().ok_or_else(|| PyValueError::new_err("Transaction already closed"))?;
-            tx.commit().await.map_err(|e| PyValueError::new_err(format!("Commit failed: {}", e)))?;
+            let tx = guard
+                .take()
+                .ok_or_else(|| PyValueError::new_err("Transaction already closed"))?;
+            tx.commit()
+                .await
+                .map_err(|e| PyValueError::new_err(format!("Commit failed: {}", e)))?;
             Ok(())
         })
     }
@@ -27,8 +31,12 @@ impl TxHandle {
         let inner = self.inner.clone();
         pyo3_async_runtimes::tokio::future_into_py(py, async move {
             let mut guard = inner.lock().await;
-            let tx = guard.take().ok_or_else(|| PyValueError::new_err("Transaction already closed"))?;
-            tx.rollback().await.map_err(|e| PyValueError::new_err(format!("Rollback failed: {}", e)))?;
+            let tx = guard
+                .take()
+                .ok_or_else(|| PyValueError::new_err("Transaction already closed"))?;
+            tx.rollback()
+                .await
+                .map_err(|e| PyValueError::new_err(format!("Rollback failed: {}", e)))?;
             Ok(())
         })
     }
