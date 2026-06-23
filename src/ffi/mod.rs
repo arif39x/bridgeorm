@@ -669,6 +669,57 @@ fn fetch_lazy(
 }
 
 #[pyfunction]
+#[pyo3(signature = (table, filters, tx=None))]
+fn delete_row<'py>(
+    py: Python<'py>,
+    table: String,
+    filters: Bound<'py, PyDict>,
+    tx: Option<PyObject>,
+) -> PyResult<Bound<'py, PyAny>> {
+    let pool_guard = POOL.read().unwrap();
+    let pool = pool_guard
+        .as_ref()
+        .ok_or_else(|| PyException::new_err("Connection pool not initialized"))?
+        .clone();
+
+    let url_guard = URL.read().unwrap();
+    let url = url_guard
+        .as_ref()
+        .ok_or_else(|| PyException::new_err("Connection URL not initialized"))?
+        .clone();
+
+    let tx_mutex = if let Some(tx_obj) = tx {
+        if let Ok(session) = tx_obj.extract::<engine::session::Session>(py) {
+            Some(session.transaction)
+        } else if let Ok(tx_handle) = tx_obj.extract::<engine::transaction::TxHandle>(py) {
+            Some(tx_handle.inner)
+        } else {
+            return Err(PyValueError::new_err(
+                "Invalid transaction or session object",
+            ));
+        }
+    } else {
+        None
+    };
+
+    let table_clone = table.clone();
+    let mut query_filters: HashMap<String, QueryValue> = HashMap::new();
+    for (k, v) in filters {
+        let key = k.extract::<String>()?;
+        query_filters.insert(
+            key.clone(),
+            py_to_query_value(py, &v, &table_clone, &key).map_err(bridge_error_to_py)?,
+        );
+    }
+
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        engine::db::generic_delete(&pool, tx_mutex.as_ref(), &url, &table, query_filters)
+            .await
+            .map_err(bridge_error_to_py)
+    })
+}
+
+#[pyfunction]
 fn execute_raw(py: Python<'_>, sql: String) -> PyResult<Bound<'_, PyAny>> {
     let pool_guard = POOL.read().unwrap();
     let pool = pool_guard
@@ -1114,6 +1165,7 @@ pub fn register_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(fetch_one_to_many, m)?)?;
     m.add_function(wrap_pyfunction!(fetch_many_to_many, m)?)?;
     m.add_function(wrap_pyfunction!(fetch_self_ref, m)?)?;
+    m.add_function(wrap_pyfunction!(delete_row, m)?)?;
     m.add_function(wrap_pyfunction!(execute_raw, m)?)?;
     m.add_function(wrap_pyfunction!(resolve_type, m)?)?;
     m.add_function(wrap_pyfunction!(engine::metadata::register_entity, m)?)?;

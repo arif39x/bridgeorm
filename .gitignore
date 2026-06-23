@@ -43,5 +43,5 @@ coverage.xml
 .DS_Store
 Thumbs.db
 *.db
-!tests/**/test.db
+/tests/
 .pyi

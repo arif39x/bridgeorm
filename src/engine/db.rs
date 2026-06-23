@@ -445,6 +445,89 @@ pub async fn generic_update(
     Ok(())
 }
 
+/// Pure Rust generic delete.
+#[must_use]
+#[tracing::instrument(skip(pool, tx))]
+pub async fn generic_delete(
+    pool: &AnyPool,
+    tx: Option<&Arc<Mutex<Option<sqlx::Transaction<'static, sqlx::Any>>>>>,
+    url: &str,
+    table_name: &str,
+    filters: HashMap<String, QueryValue>,
+) -> BridgeOrmResult<()> {
+    validate_identifier(table_name)?;
+    let dialect_type = SqlDialect::from_url(url);
+    let dialect = dialect_type.to_dialect();
+
+    let mut sql = format!("DELETE FROM {}", table_name);
+    let mut values = Vec::new();
+
+    if !filters.is_empty() {
+        sql.push_str(" WHERE ");
+        let mut where_clauses = Vec::new();
+        for (col, val) in filters {
+            validate_identifier(&col)?;
+            match val {
+                QueryValue::Raw(raw) => {
+                    let mut sql_fragment = raw.sql.clone();
+                    for p in raw.params {
+                        let placeholder = dialect.get_placeholder(values.len());
+                        sql_fragment = sql_fragment.replacen("{}", &placeholder, 1);
+                        values.push(p);
+                    }
+                    where_clauses.push(format!("{} {}", col, sql_fragment));
+                }
+                _ => {
+                    where_clauses.push(format!(
+                        "{} = {}",
+                        col,
+                        dialect.get_placeholder(values.len())
+                    ));
+                    values.push(val);
+                }
+            }
+        }
+        sql.push_str(&where_clauses.join(" AND "));
+    }
+
+    let start = Instant::now();
+    let mut query = sqlx::query(&sql);
+    for val in &values {
+        query = bind_query_value(query, val);
+    }
+
+    if let Some(tx_mutex) = tx {
+        let mut tx_guard = tx_mutex.lock().await;
+        let tx_conn = tx_guard.as_mut().ok_or_else(|| {
+            BridgeOrmError::Validation(
+                "Transaction already closed".to_string(),
+                DiagnosticInfo::default(),
+            )
+        })?;
+        query.execute(&mut **tx_conn).await.map_err(|e| {
+            BridgeOrmError::from(e)
+                .with_sql(sql.clone(), None)
+                .add_breadcrumb("generic_delete")
+        })?;
+    } else {
+        query.execute(pool).await.map_err(|e| {
+            BridgeOrmError::from(e)
+                .with_sql(sql.clone(), None)
+                .add_breadcrumb("generic_delete")
+        })?;
+    }
+
+    let duration = start.elapsed();
+    logger::emit_telemetry(TelemetryEvent {
+        sql: sql.clone(),
+        duration_micros: duration.as_micros() as u64,
+        operation: "DELETE".to_string(),
+        table: table_name.to_string(),
+    });
+
+    Ok(())
+}
+
 /// Pure Rust implementation of execute_raw.
 #[must_use]
 #[tracing::instrument(skip(pool))]

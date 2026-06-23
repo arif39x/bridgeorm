@@ -239,6 +239,21 @@ class BaseModel:
             tx.set_entity(cls, pk_values, res)
         return res
 
+    async def delete(self, tx=None) -> None:
+        pk_values = {k: getattr(self, k) for k in self._primary_keys if hasattr(self, k)}
+        if not pk_values:
+            raise ValueError(
+                f"Cannot delete '{self.__class__.__name__}' instance: "
+                f"no primary key values set"
+            )
+        rs_tx = tx._rs_session if hasattr(tx, "_rs_session") else tx
+        await bridge_orm_rs.delete_row(self.table, pk_values, tx=rs_tx)
+
+    @classmethod
+    async def delete_many(cls, tx=None, **filters) -> None:
+        rs_tx = tx._rs_session if hasattr(tx, "_rs_session") else tx
+        await bridge_orm_rs.delete_row(cls.table, filters, tx=rs_tx)
+
     def __init__(self, **kwargs):
         self._session = None
         for k, v in kwargs.items():
