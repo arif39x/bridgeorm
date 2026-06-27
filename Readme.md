@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="assets/bridge.png" alt="Bridge Logo" width="250"/>
+
 # Bridge
 
 [![Performance: Native FFI](https://img.shields.io/badge/Performance-Native_FFI-red.svg)](#architecture)
@@ -7,6 +9,9 @@
 [![Security: SQL_Injection_Proof](https://img.shields.io/badge/Security-Injection_Proof-success.svg)](#security-mandate)
 [![Reliability: Circuit_Breaker](https://img.shields.io/badge/Reliability-Circuit_Breaker-gold.svg)](#security-mandate)
 [![Observability: OpenTelemetry](https://img.shields.io/badge/Observability-OpenTelemetry-blueviolet.svg)](#architecture)
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue?logo=python)](#)
+[![Rust 1.70+](https://img.shields.io/badge/Rust-1.70%2B-orange?logo=rust)](#)
+[![sqlx 0.7](https://img.shields.io/badge/sqlx-0.7-red)](#)
 
 **Bridge** is a cross-language ORM (Rust+Python). It is lightweight, secure by default.
 
