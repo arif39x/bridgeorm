@@ -26,19 +26,59 @@ pub mod pool_config;
 pub mod type_coercion;
 use futures::stream::BoxStream;
 use futures::StreamExt;
-use once_cell::sync::Lazy;
 use pyo3::exceptions::{
     PyException, PyKeyError, PyRuntimeError, PyStopAsyncIteration, PyValueError,
 };
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
-use sqlx::{any::AnyRow, AnyPool};
+use sqlx::{any::AnyRow, AnyPool, Transaction};
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-static POOL: Lazy<std::sync::RwLock<Option<AnyPool>>> = Lazy::new(|| std::sync::RwLock::new(None));
-static URL: Lazy<std::sync::RwLock<Option<String>>> = Lazy::new(|| std::sync::RwLock::new(None));
+/// Holds pool, url, and optional transaction extracted from a tx parameter.
+struct PoolTx {
+    pool: AnyPool,
+    url: String,
+    tx_mutex: Option<Arc<Mutex<Option<Transaction<'static, sqlx::Any>>>>>,
+}
+
+/// Extracts (pool, url, optional tx_mutex) from an optional tx parameter.
+/// If tx is None, falls back to the PoolManager's default pool.
+fn extract_pool_tx(
+    py: Python<'_>,
+    tx: Option<&PyObject>,
+) -> PyResult<PoolTx> {
+    if let Some(tx_obj) = tx {
+        if let Ok(session) = tx_obj.extract::<engine::session::Session>(py) {
+            return Ok(PoolTx {
+                pool: session.pool,
+                url: session.url,
+                tx_mutex: Some(session.transaction),
+            });
+        }
+        if let Ok(tx_handle) = tx_obj.extract::<engine::transaction::TxHandle>(py) {
+            return Ok(PoolTx {
+                pool: tx_handle.pool,
+                url: tx_handle.url,
+                tx_mutex: Some(tx_handle.inner),
+            });
+        }
+        return Err(PyValueError::new_err(
+            "Invalid transaction or session object",
+        ));
+    }
+
+    let mgr = crate::engine::pool_manager::pool_manager();
+    let (pool, url) = mgr
+        .get(None)
+        .ok_or_else(|| PyException::new_err("Connection pool not initialized"))?;
+    Ok(PoolTx {
+        pool,
+        url,
+        tx_mutex: None,
+    })
+}
 
 /// Converts a `BridgeError` to a `PyErr`.
 fn bridge_error_to_py(err: BridgeError) -> PyErr {
@@ -245,11 +285,9 @@ fn connect(
             .await
             .map_err(bridge_error_to_py)?;
 
-        let mut p = POOL.write().unwrap();
-        *p = Some(pool);
-
-        let mut u = URL.write().unwrap();
-        *u = Some(url_clone);
+        let mgr = engine::pool_manager::pool_manager();
+        mgr.register("primary".to_string(), pool, url_clone.clone());
+        mgr.set_default("primary".to_string());
 
         Ok(())
     })
@@ -266,17 +304,9 @@ pub struct TableMetaProxy {
 
 #[pyfunction]
 fn reflect_schema(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
-    let pool_guard = POOL.read().unwrap();
-    let pool = pool_guard
-        .as_ref()
-        .ok_or_else(|| PyException::new_err("Connection pool not initialized"))?
-        .clone();
-
-    let url_guard = URL.read().unwrap();
-    let url = url_guard
-        .as_ref()
-        .ok_or_else(|| PyException::new_err("Connection URL not initialized"))?
-        .clone();
+    let pt = extract_pool_tx(py, None)?;
+    let pool = pt.pool;
+    let url = pt.url;
 
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let tables = schema::introspect::reflect_schema(&pool, &url)
@@ -307,17 +337,9 @@ fn reflect_schema(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
 
 #[pyfunction]
 fn reflect_table(py: Python<'_>, table_name: String) -> PyResult<Bound<'_, PyAny>> {
-    let pool_guard = POOL.read().unwrap();
-    let pool = pool_guard
-        .as_ref()
-        .ok_or_else(|| PyException::new_err("Connection pool not initialized"))?
-        .clone();
-
-    let url_guard = URL.read().unwrap();
-    let url = url_guard
-        .as_ref()
-        .ok_or_else(|| PyException::new_err("Connection URL not initialized"))?
-        .clone();
+    let pt = extract_pool_tx(py, None)?;
+    let pool = pt.pool;
+    let url = pt.url;
 
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let columns = schema::introspect::reflect_table(&pool, &url, &table_name)
@@ -347,32 +369,10 @@ fn insert_row<'py>(
     data: Bound<'py, PyDict>,
     tx: Option<PyObject>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let pool_guard = POOL.read().unwrap();
-    let pool = pool_guard
-        .as_ref()
-        .ok_or_else(|| PyException::new_err("Connection pool not initialized"))?
-        .clone();
-
-    let url_guard = URL.read().unwrap();
-    let url = url_guard
-        .as_ref()
-        .ok_or_else(|| PyException::new_err("Connection URL not initialized"))?
-        .clone();
-
-    // Extract TxHandle or Session if provided
-    let tx_mutex = if let Some(tx_obj) = tx {
-        if let Ok(session) = tx_obj.extract::<engine::session::Session>(py) {
-            Some(session.transaction)
-        } else if let Ok(tx_handle) = tx_obj.extract::<engine::transaction::TxHandle>(py) {
-            Some(tx_handle.inner)
-        } else {
-            return Err(PyValueError::new_err(
-                "Invalid transaction or session object",
-            ));
-        }
-    } else {
-        None
-    };
+    let pt = extract_pool_tx(py, tx.as_ref())?;
+    let pool = pt.pool;
+    let url = pt.url;
+    let tx_mutex = pt.tx_mutex;
 
     let table_clone = table.clone();
     let mut query_data: HashMap<String, QueryValue> = HashMap::new();
@@ -409,32 +409,10 @@ fn find_one<'py>(
     tx: Option<PyObject>,
 ) -> PyResult<Bound<'py, PyAny>> {
     ffi_guard!(py, {
-        let pool_guard = POOL.read().unwrap();
-        let pool = pool_guard
-            .as_ref()
-            .ok_or_else(|| PyException::new_err("Connection pool not initialized"))?
-            .clone();
-
-        let url_guard = URL.read().unwrap();
-        let url = url_guard
-            .as_ref()
-            .ok_or_else(|| PyException::new_err("Connection URL not initialized"))?
-            .clone();
-
-        // Extract TxHandle or Session if provided
-        let tx_mutex = if let Some(tx_obj) = tx {
-            if let Ok(session) = tx_obj.extract::<engine::session::Session>(py) {
-                Some(session.transaction)
-            } else if let Ok(tx_handle) = tx_obj.extract::<engine::transaction::TxHandle>(py) {
-                Some(tx_handle.inner)
-            } else {
-                return Err(PyValueError::new_err(
-                    "Invalid transaction or session object",
-                ));
-            }
-        } else {
-            None
-        };
+        let pt = extract_pool_tx(py, tx.as_ref())?;
+        let pool = pt.pool;
+        let url = pt.url;
+        let tx_mutex = pt.tx_mutex;
 
         let table_clone = table.clone();
         let mut query_filters: HashMap<String, QueryValue> = HashMap::new();
@@ -482,30 +460,10 @@ fn fetch_all_arrow<'py>(
     fields: Option<Vec<String>>,
     tx: Option<PyObject>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let pool_guard = POOL.read().unwrap();
-    let pool = pool_guard
-        .as_ref()
-        .ok_or_else(|| PyException::new_err("Connection pool not initialized"))?
-        .clone();
-    let url_guard = URL.read().unwrap();
-    let url = url_guard
-        .as_ref()
-        .ok_or_else(|| PyException::new_err("Connection URL not initialized"))?
-        .clone();
-
-    let tx_mutex = if let Some(tx_obj) = tx {
-        if let Ok(session) = tx_obj.extract::<engine::session::Session>(py) {
-            Some(session.transaction)
-        } else if let Ok(tx_handle) = tx_obj.extract::<engine::transaction::TxHandle>(py) {
-            Some(tx_handle.inner)
-        } else {
-            return Err(PyValueError::new_err(
-                "Invalid transaction or session object",
-            ));
-        }
-    } else {
-        None
-    };
+    let pt = extract_pool_tx(py, tx.as_ref())?;
+    let pool = pt.pool;
+    let url = pt.url;
+    let tx_mutex = pt.tx_mutex;
 
     let table_clone = table.clone();
     let mut query_filters: HashMap<String, QueryValue> = HashMap::new();
@@ -550,32 +508,10 @@ fn fetch_all<'py>(
     eager_loads: Option<Vec<Bound<'py, PyDict>>>,
     tx: Option<PyObject>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let pool_guard = POOL.read().unwrap();
-    let pool = pool_guard
-        .as_ref()
-        .ok_or_else(|| PyException::new_err("Connection pool not initialized"))?
-        .clone();
-
-    let url_guard = URL.read().unwrap();
-    let url = url_guard
-        .as_ref()
-        .ok_or_else(|| PyException::new_err("Connection URL not initialized"))?
-        .clone();
-
-    // Extract TxHandle or Session if provided
-    let tx_mutex = if let Some(tx_obj) = tx {
-        if let Ok(session) = tx_obj.extract::<engine::session::Session>(py) {
-            Some(session.transaction)
-        } else if let Ok(tx_handle) = tx_obj.extract::<engine::transaction::TxHandle>(py) {
-            Some(tx_handle.inner)
-        } else {
-            return Err(PyValueError::new_err(
-                "Invalid transaction or session object",
-            ));
-        }
-    } else {
-        None
-    };
+    let pt = extract_pool_tx(py, tx.as_ref())?;
+    let pool = pt.pool;
+    let url = pt.url;
+    let tx_mutex = pt.tx_mutex;
 
     let table_clone = table.clone();
     let mut query_filters: HashMap<String, QueryValue> = HashMap::new();
@@ -622,30 +558,10 @@ fn fetch_lazy(
     tx: Option<PyObject>,
 ) -> PyResult<LazyRowStream> {
     ffi_guard!(py, {
-        let pool_guard = POOL.read().unwrap();
-        let pool = pool_guard
-            .as_ref()
-            .ok_or_else(|| PyException::new_err("Connection pool not initialized"))?;
-
-        let url_guard = URL.read().unwrap();
-        let url = url_guard
-            .as_ref()
-            .ok_or_else(|| PyException::new_err("Connection URL not initialized"))?;
-
-        // Extract TxHandle or Session if provided
-        let tx_mutex = if let Some(tx_obj) = tx {
-            if let Ok(session) = tx_obj.extract::<engine::session::Session>(py) {
-                Some(session.transaction)
-            } else if let Ok(tx_handle) = tx_obj.extract::<engine::transaction::TxHandle>(py) {
-                Some(tx_handle.inner)
-            } else {
-                return Err(PyValueError::new_err(
-                    "Invalid transaction or session object",
-                ));
-            }
-        } else {
-            None
-        };
+        let pt = extract_pool_tx(py, tx.as_ref())?;
+        let pool = pt.pool;
+        let url = pt.url;
+        let tx_mutex = pt.tx_mutex;
 
         let table_clone = table.clone();
         let mut query_filters: HashMap<String, QueryValue> = HashMap::new();
@@ -658,7 +574,7 @@ fn fetch_lazy(
         }
 
         let stream =
-            engine::db::query_lazy(pool, tx_mutex, url, &table, query_filters, limit, fields)
+            engine::db::query_lazy(&pool, tx_mutex, &url, &table, query_filters, limit, fields)
                 .map_err(bridge_error_to_py)?;
 
         Ok(LazyRowStream {
@@ -676,31 +592,10 @@ fn delete_row<'py>(
     filters: Bound<'py, PyDict>,
     tx: Option<PyObject>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let pool_guard = POOL.read().unwrap();
-    let pool = pool_guard
-        .as_ref()
-        .ok_or_else(|| PyException::new_err("Connection pool not initialized"))?
-        .clone();
-
-    let url_guard = URL.read().unwrap();
-    let url = url_guard
-        .as_ref()
-        .ok_or_else(|| PyException::new_err("Connection URL not initialized"))?
-        .clone();
-
-    let tx_mutex = if let Some(tx_obj) = tx {
-        if let Ok(session) = tx_obj.extract::<engine::session::Session>(py) {
-            Some(session.transaction)
-        } else if let Ok(tx_handle) = tx_obj.extract::<engine::transaction::TxHandle>(py) {
-            Some(tx_handle.inner)
-        } else {
-            return Err(PyValueError::new_err(
-                "Invalid transaction or session object",
-            ));
-        }
-    } else {
-        None
-    };
+    let pt = extract_pool_tx(py, tx.as_ref())?;
+    let pool = pt.pool;
+    let url = pt.url;
+    let tx_mutex = pt.tx_mutex;
 
     let table_clone = table.clone();
     let mut query_filters: HashMap<String, QueryValue> = HashMap::new();
@@ -722,11 +617,8 @@ fn delete_row<'py>(
 #[cfg(feature = "allow-raw-sql")]
 #[pyfunction]
 fn execute_raw(py: Python<'_>, sql: String) -> PyResult<Bound<'_, PyAny>> {
-    let pool_guard = POOL.read().unwrap();
-    let pool = pool_guard
-        .as_ref()
-        .ok_or_else(|| PyException::new_err("Connection pool not initialized"))?
-        .clone();
+    let pt = extract_pool_tx(py, None)?;
+    let pool = pt.pool;
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         engine::db::execute_raw(&pool, &sql)
             .await
@@ -754,32 +646,10 @@ fn insert_rows_bulk<'py>(
     items: Vec<Bound<'py, PyDict>>,
     tx: Option<PyObject>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let pool_guard = POOL.read().unwrap();
-    let pool = pool_guard
-        .as_ref()
-        .ok_or_else(|| PyException::new_err("Connection pool not initialized"))?
-        .clone();
-
-    let url_guard = URL.read().unwrap();
-    let url = url_guard
-        .as_ref()
-        .ok_or_else(|| PyException::new_err("Connection URL not initialized"))?
-        .clone();
-
-    // Extract TxHandle or Session if provided
-    let tx_mutex = if let Some(tx_obj) = tx {
-        if let Ok(session) = tx_obj.extract::<engine::session::Session>(py) {
-            Some(session.transaction)
-        } else if let Ok(tx_handle) = tx_obj.extract::<engine::transaction::TxHandle>(py) {
-            Some(tx_handle.inner)
-        } else {
-            return Err(PyValueError::new_err(
-                "Invalid transaction or session object",
-            ));
-        }
-    } else {
-        None
-    };
+    let pt = extract_pool_tx(py, tx.as_ref())?;
+    let pool = pt.pool;
+    let url = pt.url;
+    let tx_mutex = pt.tx_mutex;
 
     let table_clone = table.clone();
     let mut query_items: Vec<HashMap<String, QueryValue>> = Vec::new();
@@ -824,32 +694,10 @@ fn fetch_one_to_many(
     parent_id: String,
     tx: Option<PyObject>,
 ) -> PyResult<Bound<'_, PyAny>> {
-    let pool_guard = POOL.read().unwrap();
-    let pool = pool_guard
-        .as_ref()
-        .ok_or_else(|| PyException::new_err("Connection pool not initialized"))?
-        .clone();
-
-    let url_guard = URL.read().unwrap();
-    let url = url_guard
-        .as_ref()
-        .ok_or_else(|| PyException::new_err("Connection URL not initialized"))?
-        .clone();
-
-    // Extract TxHandle or Session if provided
-    let tx_mutex = if let Some(tx_obj) = tx {
-        if let Ok(session) = tx_obj.extract::<engine::session::Session>(py) {
-            Some(session.transaction)
-        } else if let Ok(tx_handle) = tx_obj.extract::<engine::transaction::TxHandle>(py) {
-            Some(tx_handle.inner)
-        } else {
-            return Err(PyValueError::new_err(
-                "Invalid transaction or session object",
-            ));
-        }
-    } else {
-        None
-    };
+    let pt = extract_pool_tx(py, tx.as_ref())?;
+    let pool = pt.pool;
+    let url = pt.url;
+    let tx_mutex = pt.tx_mutex;
 
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let rows = engine::relations::fetch_one_to_many(
@@ -885,32 +733,10 @@ fn fetch_many_to_many(
     parent_id: String,
     tx: Option<PyObject>,
 ) -> PyResult<Bound<'_, PyAny>> {
-    let pool_guard = POOL.read().unwrap();
-    let pool = pool_guard
-        .as_ref()
-        .ok_or_else(|| PyException::new_err("Connection pool not initialized"))?
-        .clone();
-
-    let url_guard = URL.read().unwrap();
-    let url = url_guard
-        .as_ref()
-        .ok_or_else(|| PyException::new_err("Connection URL not initialized"))?
-        .clone();
-
-    // Extract TxHandle or Session if provided
-    let tx_mutex = if let Some(tx_obj) = tx {
-        if let Ok(session) = tx_obj.extract::<engine::session::Session>(py) {
-            Some(session.transaction)
-        } else if let Ok(tx_handle) = tx_obj.extract::<engine::transaction::TxHandle>(py) {
-            Some(tx_handle.inner)
-        } else {
-            return Err(PyValueError::new_err(
-                "Invalid transaction or session object",
-            ));
-        }
-    } else {
-        None
-    };
+    let pt = extract_pool_tx(py, tx.as_ref())?;
+    let pool = pt.pool;
+    let url = pt.url;
+    let tx_mutex = pt.tx_mutex;
 
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let rows = engine::relations::fetch_many_to_many(
@@ -946,32 +772,10 @@ fn fetch_self_ref(
     parent_id: String,
     tx: Option<PyObject>,
 ) -> PyResult<Bound<'_, PyAny>> {
-    let pool_guard = POOL.read().unwrap();
-    let pool = pool_guard
-        .as_ref()
-        .ok_or_else(|| PyException::new_err("Connection pool not initialized"))?
-        .clone();
-
-    let url_guard = URL.read().unwrap();
-    let url = url_guard
-        .as_ref()
-        .ok_or_else(|| PyException::new_err("Connection URL not initialized"))?
-        .clone();
-
-    // Extract TxHandle or Session if provided
-    let tx_mutex = if let Some(tx_obj) = tx {
-        if let Ok(session) = tx_obj.extract::<engine::session::Session>(py) {
-            Some(session.transaction)
-        } else if let Ok(tx_handle) = tx_obj.extract::<engine::transaction::TxHandle>(py) {
-            Some(tx_handle.inner)
-        } else {
-            return Err(PyValueError::new_err(
-                "Invalid transaction or session object",
-            ));
-        }
-    } else {
-        None
-    };
+    let pt = extract_pool_tx(py, tx.as_ref())?;
+    let pool = pt.pool;
+    let url = pt.url;
+    let tx_mutex = pt.tx_mutex;
 
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let rows = engine::relations::fetch_self_ref(
@@ -1005,27 +809,10 @@ fn batch_fetch_one_to_many<'py>(
     parent_ids: Vec<String>,
     tx: Option<PyObject>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let pool_guard = POOL.read().unwrap();
-    let pool = pool_guard
-        .as_ref()
-        .ok_or_else(|| PyException::new_err("Connection pool not initialized"))?
-        .clone();
-    let url_guard = URL.read().unwrap();
-    let url = url_guard
-        .as_ref()
-        .ok_or_else(|| PyException::new_err("Connection URL not initialized"))?
-        .clone();
-    let tx_mutex = if let Some(tx_obj) = tx {
-        if let Ok(session) = tx_obj.extract::<engine::session::Session>(py) {
-            Some(session.transaction)
-        } else if let Ok(tx_handle) = tx_obj.extract::<engine::transaction::TxHandle>(py) {
-            Some(tx_handle.inner)
-        } else {
-            return Err(PyValueError::new_err("Invalid transaction or session object"));
-        }
-    } else {
-        None
-    };
+    let pt = extract_pool_tx(py, tx.as_ref())?;
+    let pool = pt.pool;
+    let url = pt.url;
+    let tx_mutex = pt.tx_mutex;
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let grouped = engine::relations::batch_fetch_one_to_many(
             &pool, tx_mutex.as_ref(), &url, &child_table, &foreign_key, &parent_ids,
@@ -1060,27 +847,10 @@ fn batch_fetch_many_to_many<'py>(
     parent_ids: Vec<String>,
     tx: Option<PyObject>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let pool_guard = POOL.read().unwrap();
-    let pool = pool_guard
-        .as_ref()
-        .ok_or_else(|| PyException::new_err("Connection pool not initialized"))?
-        .clone();
-    let url_guard = URL.read().unwrap();
-    let url = url_guard
-        .as_ref()
-        .ok_or_else(|| PyException::new_err("Connection URL not initialized"))?
-        .clone();
-    let tx_mutex = if let Some(tx_obj) = tx {
-        if let Ok(session) = tx_obj.extract::<engine::session::Session>(py) {
-            Some(session.transaction)
-        } else if let Ok(tx_handle) = tx_obj.extract::<engine::transaction::TxHandle>(py) {
-            Some(tx_handle.inner)
-        } else {
-            return Err(PyValueError::new_err("Invalid transaction or session object"));
-        }
-    } else {
-        None
-    };
+    let pt = extract_pool_tx(py, tx.as_ref())?;
+    let pool = pt.pool;
+    let url = pt.url;
+    let tx_mutex = pt.tx_mutex;
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let grouped = engine::relations::batch_fetch_many_to_many(
             &pool, tx_mutex.as_ref(), &url, &target_table, &junction_table,
@@ -1114,27 +884,10 @@ fn batch_fetch_self_ref<'py>(
     parent_ids: Vec<String>,
     tx: Option<PyObject>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let pool_guard = POOL.read().unwrap();
-    let pool = pool_guard
-        .as_ref()
-        .ok_or_else(|| PyException::new_err("Connection pool not initialized"))?
-        .clone();
-    let url_guard = URL.read().unwrap();
-    let url = url_guard
-        .as_ref()
-        .ok_or_else(|| PyException::new_err("Connection URL not initialized"))?
-        .clone();
-    let tx_mutex = if let Some(tx_obj) = tx {
-        if let Ok(session) = tx_obj.extract::<engine::session::Session>(py) {
-            Some(session.transaction)
-        } else if let Ok(tx_handle) = tx_obj.extract::<engine::transaction::TxHandle>(py) {
-            Some(tx_handle.inner)
-        } else {
-            return Err(PyValueError::new_err("Invalid transaction or session object"));
-        }
-    } else {
-        None
-    };
+    let pt = extract_pool_tx(py, tx.as_ref())?;
+    let pool = pt.pool;
+    let url = pt.url;
+    let tx_mutex = pt.tx_mutex;
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let grouped = engine::relations::batch_fetch_self_ref(
             &pool, tx_mutex.as_ref(), &url, &table, &parent_key, &parent_ids,
@@ -1159,15 +912,15 @@ fn batch_fetch_self_ref<'py>(
 }
 
 #[pyfunction]
-fn begin_transaction(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
-    let pool_guard = POOL.read().unwrap();
-    let pool = pool_guard
-        .as_ref()
-        .ok_or_else(|| PyException::new_err("Connection pool not initialized"))?
-        .clone();
+#[pyo3(signature = (pool_key=None))]
+fn begin_transaction(py: Python<'_>, pool_key: Option<String>) -> PyResult<Bound<'_, PyAny>> {
+    let mgr = engine::pool_manager::pool_manager();
+    let (pool, url) = mgr
+        .get(pool_key.as_deref())
+        .ok_or_else(|| PyException::new_err("Connection pool not initialized"))?;
 
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let tx = engine::transaction::begin_transaction(&pool)
+        let tx = engine::transaction::begin_transaction(&pool, &url)
             .await
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(tx)
@@ -1175,15 +928,15 @@ fn begin_transaction(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
 }
 
 #[pyfunction]
-fn begin_session(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
-    let pool_guard = POOL.read().unwrap();
-    let pool = pool_guard
-        .as_ref()
-        .ok_or_else(|| PyException::new_err("Connection pool not initialized"))?
-        .clone();
+#[pyo3(signature = (pool_key=None))]
+fn begin_session(py: Python<'_>, pool_key: Option<String>) -> PyResult<Bound<'_, PyAny>> {
+    let mgr = engine::pool_manager::pool_manager();
+    let (pool, url) = mgr
+        .get(pool_key.as_deref())
+        .ok_or_else(|| PyException::new_err("Connection pool not initialized"))?;
 
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let session = engine::session::begin_session(pool)
+        let session = engine::session::begin_session(pool, url)
             .await
             .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(session)
@@ -1216,17 +969,8 @@ fn flush<'py>(
     dirty_entities: Vec<(String, String, Bound<'py, PyDict>, Bound<'py, PyDict>)>,
 ) -> PyResult<Bound<'py, PyAny>> {
     ffi_guard!(py, {
-        let pool_guard = POOL.read().unwrap();
-        let pool = pool_guard
-            .as_ref()
-            .ok_or_else(|| PyException::new_err("Connection pool not initialized"))?
-            .clone();
-
-        let url_guard = URL.read().unwrap();
-        let url = url_guard
-            .as_ref()
-            .ok_or_else(|| PyException::new_err("Connection URL not initialized"))?
-            .clone();
+        let pool = session.pool.clone();
+        let url = session.url.clone();
 
         // To make it Send-safe, compute diffs and prepare updates synchronously (with GIL)
         // and then only pass pure Rust data into the async block.

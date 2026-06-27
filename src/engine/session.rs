@@ -11,6 +11,7 @@ use tokio::sync::Mutex as TokioMutex;
 #[derive(Clone)]
 pub struct Session {
     pub pool: AnyPool,
+    pub url: String,
     pub transaction: Arc<TokioMutex<Option<Transaction<'static, Any>>>>,
     pub identity_map: Arc<Mutex<HashMap<String, PyObject>>>,
     pub dirty_tracker: Arc<Mutex<DirtyTracker>>,
@@ -116,10 +117,11 @@ impl Session {
     }
 }
 
-pub async fn begin_session(pool: AnyPool) -> BridgeResult<Session> {
+pub async fn begin_session(pool: AnyPool, url: String) -> BridgeResult<Session> {
     let tx = pool.begin().await?;
     Ok(Session {
         pool,
+        url,
         transaction: Arc::new(TokioMutex::new(Some(tx))),
         identity_map: Arc::new(Mutex::new(HashMap::new())),
         dirty_tracker: Arc::new(Mutex::new(DirtyTracker::new())),

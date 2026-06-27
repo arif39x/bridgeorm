@@ -9,6 +9,7 @@ pub mod loader;
 pub mod loading;
 pub mod metadata;
 pub mod mutation;
+pub mod pool_manager;
 pub mod query;
 pub mod relations;
 pub mod session;

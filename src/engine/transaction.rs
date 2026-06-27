@@ -8,6 +8,8 @@ use tokio::sync::Mutex;
 #[derive(Clone)]
 pub struct TxHandle {
     pub inner: Arc<Mutex<Option<Transaction<'static, Any>>>>,
+    pub pool: sqlx::AnyPool,
+    pub url: String,
     pub savepoint_depth: u32,
 }
 
@@ -42,10 +44,12 @@ impl TxHandle {
     }
 }
 
-pub async fn begin_transaction(pool: &sqlx::AnyPool) -> Result<TxHandle, sqlx::Error> {
+pub async fn begin_transaction(pool: &sqlx::AnyPool, url: &str) -> Result<TxHandle, sqlx::Error> {
     let tx = pool.begin().await?;
     Ok(TxHandle {
         inner: Arc::new(Mutex::new(Some(tx))),
+        pool: pool.clone(),
+        url: url.to_string(),
         savepoint_depth: 0,
     })
 }
