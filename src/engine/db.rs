@@ -321,6 +321,90 @@ pub fn validate_filter_value(value: &QueryValue) -> BridgeResult<()> {
     Ok(())
 }
 
+/// Runtime schema validation: checks that filter column names exist in the
+/// registered metadata and that `QueryValue` types are compatible with the
+/// column's declared data type.
+///
+/// Only active in debug builds (`#[cfg(debug_assertions)]`); compiled away in
+/// release builds so there is zero production overhead.
+#[must_use]
+pub fn validate_query_filters(
+    table_name: &str,
+    filters: &[(String, QueryValue)],
+) -> BridgeResult<()> {
+    #[cfg(debug_assertions)]
+    {
+        use crate::engine::metadata::REGISTRY;
+
+        let registry_guard = REGISTRY.read().unwrap();
+        if let Some(mapping) = registry_guard.mappings.get(table_name) {
+            for (col, val) in filters {
+                let meta = mapping.columns.get(col).ok_or_else(|| {
+                    BridgeError::Validation(
+                        format!(
+                            "Schema validation: column '{}' not found in table '{}'. \
+                             Available columns: {:?}",
+                            col,
+                            table_name,
+                            mapping.columns.keys().collect::<Vec<_>>(),
+                        ),
+                        DiagnosticInfo::default(),
+                    )
+                })?;
+
+                if !query_value_type_matches(val, &meta.data_type) {
+                    return Err(BridgeError::TypeMismatch {
+                        field: format!("{}.{}", table_name, col),
+                        expected: meta.data_type.clone(),
+                        got: format!("{:?}", val),
+                        info: DiagnosticInfo::default(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(debug_assertions)]
+fn query_value_type_matches(value: &QueryValue, data_type: &str) -> bool {
+    use QueryValue::*;
+    match value {
+        String(_) => matches!(
+            data_type.to_lowercase().as_str(),
+            "text" | "str" | "varchar" | "string"
+        ),
+        Int(_) => matches!(
+            data_type.to_lowercase().as_str(),
+            "int" | "bigint" | "integer" | "smallint"
+        ),
+        Float(_) => matches!(
+            data_type.to_lowercase().as_str(),
+            "float" | "double" | "real" | "double precision"
+        ),
+        Bool(_) => matches!(
+            data_type.to_lowercase().as_str(),
+            "bool" | "boolean"
+        ),
+        Uuid(_) => data_type.to_lowercase() == "uuid",
+        DateTime(_) => matches!(
+            data_type.to_lowercase().as_str(),
+            "datetime" | "timestamp" | "timestamptz"
+        ),
+        Json(_) => matches!(
+            data_type.to_lowercase().as_str(),
+            "json" | "jsonb"
+        ),
+        Bytes(_) => matches!(
+            data_type.to_lowercase().as_str(),
+            "bytes" | "blob" | "bytea"
+        ),
+        Null => true,
+        #[cfg(feature = "allow-raw-sql")]
+        Raw(_) => true,
+    }
+}
+
 /// Establishes a connection pool using the provided URL and configuration.
 /// Uses sqlx's built-in pool.
 #[must_use]
@@ -414,12 +498,17 @@ pub async fn generic_update(
         return Ok(());
     }
 
+    let data_vec: Vec<(String, QueryValue)> = data.into_iter().collect();
+    for (col, _) in &data_vec {
+        validate_identifier(col)?;
+    }
+    validate_query_filters(table_name, &data_vec)?;
+
     let mut sql = format!("UPDATE {} SET ", dialect.quote_identifier(table_name));
     let mut values = Vec::new();
     let mut set_clauses = Vec::new();
 
-    for (col, val) in data {
-        validate_identifier(&col)?;
+    for (col, val) in data_vec {
         match val {
             #[cfg(feature = "allow-raw-sql")]
             QueryValue::Raw(_) => {
@@ -441,11 +530,16 @@ pub async fn generic_update(
     sql.push_str(&set_clauses.join(", "));
 
     if !filters.is_empty() {
+        let filters_vec: Vec<(String, QueryValue)> = filters.into_iter().collect();
+        for (col, val) in &filters_vec {
+            validate_identifier(col)?;
+            validate_filter_value(val)?;
+        }
+        validate_query_filters(table_name, &filters_vec)?;
+
         sql.push_str(" WHERE ");
         let mut where_clauses = Vec::new();
-        for (col, val) in filters {
-            validate_identifier(&col)?;
-            validate_filter_value(&val)?;
+        for (col, val) in filters_vec {
             match val {
                 #[cfg(feature = "allow-raw-sql")]
                 QueryValue::Raw(_) => {
@@ -514,11 +608,16 @@ pub async fn generic_delete(
     let mut values = Vec::new();
 
     if !filters.is_empty() {
+        let filters_vec: Vec<(String, QueryValue)> = filters.into_iter().collect();
+        for (col, val) in &filters_vec {
+            validate_identifier(col)?;
+            validate_filter_value(val)?;
+        }
+        validate_query_filters(table_name, &filters_vec)?;
+
         sql.push_str(" WHERE ");
         let mut where_clauses = Vec::new();
-        for (col, val) in filters {
-            validate_identifier(&col)?;
-            validate_filter_value(&val)?;
+        for (col, val) in filters_vec {
             match val {
                 #[cfg(feature = "allow-raw-sql")]
                 QueryValue::Raw(_) => {
@@ -604,11 +703,17 @@ pub async fn generic_insert(
     let dialect_type = SqlDialect::from_url(url);
     let dialect = dialect_type.to_dialect();
 
+    let data_vec: Vec<(String, QueryValue)> = data.into_iter().collect();
+    for (col, _) in &data_vec {
+        validate_identifier(col)?;
+    }
+    validate_query_filters(table_name, &data_vec)?;
+
     let mut columns = Vec::new();
     let mut values = Vec::new();
     let mut placeholders = Vec::new();
 
-    for (col, val) in &data {
+    for (col, val) in &data_vec {
         validate_identifier(col)?;
         columns.push(col.clone());
         match val {
@@ -669,7 +774,7 @@ pub async fn generic_insert(
         table: table_name.to_string(),
     });
 
-    Ok(data)
+    Ok(data_vec.into_iter().collect())
 }
 
 /// Pure Rust generic bulk insert.
@@ -693,6 +798,11 @@ pub async fn generic_insert_bulk(
     // Assume all items have the same keys as the first item for bulk construction
     let first_item = &items[0];
     let (columns, _, _) = prepare_statement(dialect.as_ref(), first_item)?;
+
+    for item in &items {
+        let item_vec: Vec<(String, QueryValue)> = item.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+        validate_query_filters(table_name, &item_vec)?;
+    }
 
     let quoted_cols: Vec<String> = columns.iter().map(|c| dialect.quote_identifier(c)).collect();
     let mut sql = format!(
@@ -791,6 +901,7 @@ pub async fn generic_query(
         validate_identifier(col)?;
         validate_filter_value(val)?;
     }
+    validate_query_filters(table_name, &filter_vec)?;
 
     let (sql, values) = dialect.build_select(table_name, &columns, &filter_vec, limit)?;
 
