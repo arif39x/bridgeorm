@@ -1,30 +1,34 @@
-use crate::engine::db::SqlDialect; // Temporary alias since Dialect is not implemented yet
+use crate::engine::db::{bind_query_value, Dialect, SqlDialect};
 use crate::engine::identity_map::shared_identity_map::SharedIdentityMap;
+use crate::engine::query::QueryValue;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tracing::instrument;
 
-/// The maximum number of version digits. Used for parameter slot calculation.
 const VERSION_COLUMN_NAME: &str = "_bridge_row_version";
 
 pub struct VersionGuardedUpdater<'dialect> {
     dialect: &'dialect SqlDialect,
     identity_map: SharedIdentityMap,
+    pool: sqlx::AnyPool,
+    tx: Option<Arc<Mutex<Option<sqlx::Transaction<'static, sqlx::Any>>>>>,
 }
 
 impl<'dialect> VersionGuardedUpdater<'dialect> {
-    pub fn new(dialect: &'dialect SqlDialect, identity_map: SharedIdentityMap) -> Self {
+    pub fn new(
+        dialect: &'dialect SqlDialect,
+        identity_map: SharedIdentityMap,
+        pool: sqlx::AnyPool,
+        tx: Option<Arc<Mutex<Option<sqlx::Transaction<'static, sqlx::Any>>>>>,
+    ) -> Self {
         Self {
             dialect,
             identity_map,
+            pool,
+            tx,
         }
     }
 
-    /// Executes an UPDATE that includes a `WHERE _bridge_row_version = :known_version`
-    /// guard clause. If zero rows are affected, it means another task updated
-    /// the row between our read and this write — raises `ConcurrentUpdateError`.
-    ///
-    /// WHY: This is Optimistic Concurrency Control (OCC). We optimistically
-    /// assume no collision happened; if we were wrong, the version guard catches
-    /// it and forces the caller to re-read and decide how to merge or retry.
     #[instrument(
         name = "version_guarded_updater.update",
         fields(table = %table_name, pk = %primary_key_value, known_version = %known_version),
@@ -40,24 +44,29 @@ impl<'dialect> VersionGuardedUpdater<'dialect> {
     ) -> Result<(), VersionGuardedUpdateError> {
         let next_version = known_version + 1;
 
-        /* Temporarily commented out dialect interaction
-        let guarded_sql = self.dialect.build_version_guarded_update(
-            table_name,
-            primary_key_column,
-            primary_key_value,
-            VERSION_COLUMN_NAME,
-            known_version,
-            next_version,
-            &column_value_pairs,
-        )?;
+        let converted: Vec<(String, QueryValue)> = column_value_pairs
+            .into_iter()
+            .map(|(col, val)| (col, json_to_query_value(val)))
+            .collect();
 
-        let affected_row_count = self.execute_update(&guarded_sql).await?;
-        */
-        let affected_row_count = 1; // Mocking for now
+        let dialect = self.dialect.to_dialect();
+        let (sql, values) = dialect
+            .build_version_guarded_update(
+                table_name,
+                primary_key_column,
+                primary_key_value,
+                VERSION_COLUMN_NAME,
+                known_version,
+                next_version,
+                &converted,
+            )
+            .map_err(|e| VersionGuardedUpdateError::DialectQueryBuildFailure {
+                reason: e.to_string(),
+            })?;
+
+        let affected_row_count = self.execute_update(&sql, &values).await?;
 
         if affected_row_count == 0 {
-            // WHY: We evict the stale cache entry so the next read fetches
-            // the current state from the database rather than serving stale data.
             self.identity_map.evict(table_name, primary_key_value);
 
             return Err(VersionGuardedUpdateError::ConcurrentUpdateDetected {
@@ -67,15 +76,58 @@ impl<'dialect> VersionGuardedUpdater<'dialect> {
             });
         }
 
-        // Update the identity map to reflect the new version.
-        // WHY: If we do not update the cache here, a subsequent read in the
-        // same request would return the pre-update state.
-        // (Full row re-fetch is delegated to a post-update hook.)
         Ok(())
     }
 
-    async fn execute_update(&self, compiled_sql: &str) -> Result<u64, VersionGuardedUpdateError> {
-        todo!("delegate to engine::db::execute_mutation(compiled_sql)")
+    async fn execute_update(
+        &self,
+        sql: &str,
+        values: &[QueryValue],
+    ) -> Result<u64, VersionGuardedUpdateError> {
+        let mut query = sqlx::query(sql);
+        for val in values {
+            query = bind_query_value(query, val);
+        }
+
+        let result = if let Some(tx_mutex) = &self.tx {
+            let mut tx_guard = tx_mutex.lock().await;
+            let tx_conn = tx_guard.as_mut().ok_or_else(|| {
+                VersionGuardedUpdateError::DatabaseExecutionFailure {
+                    reason: "Transaction already closed".to_string(),
+                }
+            })?;
+            query.execute(&mut **tx_conn).await.map_err(|e| {
+                VersionGuardedUpdateError::DatabaseExecutionFailure {
+                    reason: e.to_string(),
+                }
+            })?
+        } else {
+            query.execute(&self.pool).await.map_err(|e| {
+                VersionGuardedUpdateError::DatabaseExecutionFailure {
+                    reason: e.to_string(),
+                }
+            })?
+        };
+
+        Ok(result.rows_affected())
+    }
+}
+
+fn json_to_query_value(value: serde_json::Value) -> QueryValue {
+    match value {
+        serde_json::Value::String(s) => QueryValue::String(s),
+        serde_json::Value::Number(n) => {
+            if let Some(i) = n.as_i64() {
+                QueryValue::Int(i)
+            } else if let Some(f) = n.as_f64() {
+                QueryValue::Float(f)
+            } else {
+                QueryValue::Null
+            }
+        }
+        serde_json::Value::Bool(b) => QueryValue::Bool(b),
+        serde_json::Value::Null => QueryValue::Null,
+        other => QueryValue::Json(other),
     }
 }
 

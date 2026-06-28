@@ -152,6 +152,57 @@ pub trait Dialect: Send + Sync {
 
         Ok((sql, values))
     }
+    fn build_version_guarded_update(
+        &self,
+        table_name: &str,
+        primary_key_column: &str,
+        primary_key_value: &str,
+        version_column_name: &str,
+        known_version: u64,
+        next_version: u64,
+        column_value_pairs: &[(String, QueryValue)],
+    ) -> BridgeResult<(String, Vec<QueryValue>)> {
+        validate_identifier(table_name)?;
+        validate_identifier(primary_key_column)?;
+        validate_identifier(version_column_name)?;
+        for (col, _) in column_value_pairs {
+            validate_identifier(col)?;
+        }
+
+        let mut sql = format!("UPDATE {} SET ", self.quote_identifier(table_name));
+        let mut values = Vec::new();
+        let mut set_clauses = Vec::new();
+
+        for (col, val) in column_value_pairs {
+            set_clauses.push(format!(
+                "{} = {}",
+                self.quote_identifier(col),
+                self.get_placeholder(values.len())
+            ));
+            values.push(val.clone());
+        }
+
+        set_clauses.push(format!(
+            "{} = {}",
+            self.quote_identifier(version_column_name),
+            self.get_placeholder(values.len())
+        ));
+        values.push(QueryValue::Int(next_version as i64));
+
+        sql.push_str(&set_clauses.join(", "));
+
+        sql.push_str(&format!(
+            " WHERE {} = {} AND {} = {}",
+            self.quote_identifier(primary_key_column),
+            self.get_placeholder(values.len()),
+            self.quote_identifier(version_column_name),
+            self.get_placeholder(values.len() + 1),
+        ));
+        values.push(QueryValue::String(primary_key_value.to_owned()));
+        values.push(QueryValue::Int(known_version as i64));
+
+        Ok((sql, values))
+    }
 }
 
 pub struct SqliteDialect;
