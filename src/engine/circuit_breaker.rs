@@ -41,12 +41,17 @@ impl CircuitBreaker {
     {
         self.before_call()?;
         let result = f().await;
-        self.after_call(&result);
+        self.after_call(&result)?;
         result
     }
 
     fn before_call(&self) -> Result<(), BridgeError> {
-        let mut state = self.state.lock().unwrap();
+        let mut state = self.state.lock().map_err(|e| {
+            BridgeError::Internal(
+                format!("Circuit breaker lock poisoned: {}", e),
+                DiagnosticInfo::default(),
+            )
+        })?;
         match state.current_state {
             State::Closed => Ok(()),
             State::Open => {
@@ -65,8 +70,13 @@ impl CircuitBreaker {
         }
     }
 
-    fn after_call<R>(&self, result: &Result<R, BridgeError>) {
-        let mut state = self.state.lock().unwrap();
+    fn after_call<R>(&self, result: &Result<R, BridgeError>) -> Result<(), BridgeError> {
+        let mut state = self.state.lock().map_err(|e| {
+            BridgeError::Internal(
+                format!("Circuit breaker lock poisoned: {}", e),
+                DiagnosticInfo::default(),
+            )
+        })?;
         match result {
             Ok(_) => {
                 state.failures = 0;
@@ -84,5 +94,6 @@ impl CircuitBreaker {
                 _ => {}
             },
         }
+        Ok(())
     }
 }

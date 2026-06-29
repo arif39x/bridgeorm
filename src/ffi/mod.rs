@@ -69,6 +69,7 @@ fn extract_pool_tx(py: Python<'_>, tx: Option<&PyObject>) -> PyResult<PoolTx> {
     let mgr = crate::engine::pool_manager::pool_manager();
     let (pool, url) = mgr
         .get(None)
+        .map_err(bridge_error_to_py)?
         .ok_or_else(|| PyException::new_err("Connection pool not initialized"))?;
     Ok(PoolTx {
         pool,
@@ -295,8 +296,10 @@ fn connect(
             .map_err(bridge_error_to_py)?;
 
         let mgr = engine::pool_manager::pool_manager();
-        mgr.register("primary".to_string(), pool, url_clone.clone());
-        mgr.set_default("primary".to_string());
+        mgr.register("primary".to_string(), pool, url_clone.clone())
+            .map_err(bridge_error_to_py)?;
+        mgr.set_default("primary".to_string())
+            .map_err(bridge_error_to_py)?;
 
         Ok(())
     })
@@ -941,6 +944,7 @@ fn begin_transaction(py: Python<'_>, pool_key: Option<String>) -> PyResult<Bound
     let mgr = engine::pool_manager::pool_manager();
     let (pool, url) = mgr
         .get(pool_key.as_deref())
+        .map_err(bridge_error_to_py)?
         .ok_or_else(|| PyException::new_err("Connection pool not initialized"))?;
 
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
@@ -957,6 +961,7 @@ fn begin_session(py: Python<'_>, pool_key: Option<String>) -> PyResult<Bound<'_,
     let mgr = engine::pool_manager::pool_manager();
     let (pool, url) = mgr
         .get(pool_key.as_deref())
+        .map_err(bridge_error_to_py)?
         .ok_or_else(|| PyException::new_err("Connection pool not initialized"))?;
 
     pyo3_async_runtimes::tokio::future_into_py(py, async move {

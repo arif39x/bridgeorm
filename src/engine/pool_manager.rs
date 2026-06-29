@@ -1,3 +1,4 @@
+use crate::error::{BridgeError, BridgeResult, DiagnosticInfo};
 use sqlx::AnyPool;
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -18,43 +19,59 @@ impl PoolManager {
         }
     }
 
-    pub fn register(&self, key: String, pool: AnyPool, url: String) {
-        let mut pools = self.pools.write().unwrap();
-        pools.insert(key.clone(), pool);
-        let mut urls = self.urls.write().unwrap();
-        urls.insert(key, url);
+    fn poison_err(lock_name: &str) -> BridgeError {
+        BridgeError::Internal(
+            format!("Pool manager lock poisoned: {}", lock_name),
+            DiagnosticInfo::default(),
+        )
     }
 
-    pub fn get(&self, key: Option<&str>) -> Option<(AnyPool, String)> {
-        let pools = self.pools.read().unwrap();
-        let urls = self.urls.read().unwrap();
+    pub fn register(&self, key: String, pool: AnyPool, url: String) -> BridgeResult<()> {
+        let mut pools = self.pools.write().map_err(|_| Self::poison_err("pools"))?;
+        pools.insert(key.clone(), pool);
+        let mut urls = self.urls.write().map_err(|_| Self::poison_err("urls"))?;
+        urls.insert(key, url);
+        Ok(())
+    }
+
+    pub fn get(&self, key: Option<&str>) -> BridgeResult<Option<(AnyPool, String)>> {
+        let pools = self.pools.read().map_err(|_| Self::poison_err("pools"))?;
+        let urls = self.urls.read().map_err(|_| Self::poison_err("urls"))?;
         let actual_key = match key {
             Some(k) => k.to_string(),
-            None => self.default_key.read().unwrap().clone()?,
+            None => match self.default_key.read().map_err(|_| Self::poison_err("default_key"))?.clone() {
+                Some(k) => k,
+                None => return Ok(None),
+            },
         };
-        Some((pools.get(&actual_key)?.clone(), urls.get(&actual_key)?.clone()))
-    }
-
-    pub fn set_default(&self, key: String) {
-        let mut default = self.default_key.write().unwrap();
-        *default = Some(key);
-    }
-
-    pub fn get_default_key(&self) -> Option<String> {
-        self.default_key.read().unwrap().clone()
-    }
-
-    pub fn remove(&self, key: &str) {
-        self.pools.write().unwrap().remove(key);
-        self.urls.write().unwrap().remove(key);
-        let mut default = self.default_key.write().unwrap();
-        if default.as_deref() == Some(key) {
-            *default = None;
+        match (pools.get(&actual_key), urls.get(&actual_key)) {
+            (Some(pool), Some(url)) => Ok(Some((pool.clone(), url.clone()))),
+            _ => Ok(None),
         }
     }
 
-    pub fn contains(&self, key: &str) -> bool {
-        self.pools.read().unwrap().contains_key(key)
+    pub fn set_default(&self, key: String) -> BridgeResult<()> {
+        let mut default = self.default_key.write().map_err(|_| Self::poison_err("default_key"))?;
+        *default = Some(key);
+        Ok(())
+    }
+
+    pub fn get_default_key(&self) -> BridgeResult<Option<String>> {
+        self.default_key.read().map(|g| g.clone()).map_err(|_| Self::poison_err("default_key"))
+    }
+
+    pub fn remove(&self, key: &str) -> BridgeResult<()> {
+        self.pools.write().map_err(|_| Self::poison_err("pools"))?.remove(key);
+        self.urls.write().map_err(|_| Self::poison_err("urls"))?.remove(key);
+        let mut default = self.default_key.write().map_err(|_| Self::poison_err("default_key"))?;
+        if default.as_deref() == Some(key) {
+            *default = None;
+        }
+        Ok(())
+    }
+
+    pub fn contains(&self, key: &str) -> BridgeResult<bool> {
+        self.pools.read().map(|g| g.contains_key(key)).map_err(|_| Self::poison_err("pools"))
     }
 }
 
