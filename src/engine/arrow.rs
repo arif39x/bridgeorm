@@ -1,5 +1,5 @@
 use crate::engine::metadata::REGISTRY;
-use crate::error::BridgeResult;
+use crate::error::{BridgeError, BridgeResult, DiagnosticInfo};
 use arrow::array::{ArrayRef, BooleanBuilder, Float64Builder, Int64Builder, StringBuilder};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -12,7 +12,12 @@ pub fn rows_to_arrow_ipc(table_name: &str, rows: &[AnyRow]) -> BridgeResult<Vec<
         return Ok(Vec::new());
     }
 
-    let registry_guard = REGISTRY.read().unwrap();
+    let registry_guard = REGISTRY.read().map_err(|e| {
+        BridgeError::Internal(
+            format!("Registry lock poisoned: {}", e),
+            DiagnosticInfo::default(),
+        )
+    })?;
     let mapping = registry_guard.mappings.get(table_name);
 
     let first_row = &rows[0];
@@ -51,10 +56,18 @@ pub fn rows_to_arrow_ipc(table_name: &str, rows: &[AnyRow]) -> BridgeResult<Vec<
             let name = column.name();
             let builder = &mut builders[i];
 
+            let internal_type_err = || BridgeError::Internal(
+                format!("Arrow builder type mismatch for column '{}'", name),
+                DiagnosticInfo::default(),
+            );
+
             if let Some(meta) = mapping.and_then(|m| m.columns.get(name)) {
                 match meta.data_type.to_lowercase().as_str() {
                     "int" | "bigint" | "integer" => {
-                        let b = builder.as_any_mut().downcast_mut::<Int64Builder>().unwrap();
+                        let b = builder
+                            .as_any_mut()
+                            .downcast_mut::<Int64Builder>()
+                            .ok_or_else(internal_type_err)?;
                         if let Ok(val) = row.try_get::<i64, _>(name) {
                             b.append_value(val);
                         } else {
@@ -65,7 +78,7 @@ pub fn rows_to_arrow_ipc(table_name: &str, rows: &[AnyRow]) -> BridgeResult<Vec<
                         let b = builder
                             .as_any_mut()
                             .downcast_mut::<BooleanBuilder>()
-                            .unwrap();
+                            .ok_or_else(internal_type_err)?;
                         if let Ok(val) = row.try_get::<bool, _>(name) {
                             b.append_value(val);
                         } else {
@@ -76,7 +89,7 @@ pub fn rows_to_arrow_ipc(table_name: &str, rows: &[AnyRow]) -> BridgeResult<Vec<
                         let b = builder
                             .as_any_mut()
                             .downcast_mut::<Float64Builder>()
-                            .unwrap();
+                            .ok_or_else(internal_type_err)?;
                         if let Ok(val) = row.try_get::<f64, _>(name) {
                             b.append_value(val);
                         } else {
@@ -87,7 +100,7 @@ pub fn rows_to_arrow_ipc(table_name: &str, rows: &[AnyRow]) -> BridgeResult<Vec<
                         let b = builder
                             .as_any_mut()
                             .downcast_mut::<StringBuilder>()
-                            .unwrap();
+                            .ok_or_else(internal_type_err)?;
                         if let Ok(val) = row.try_get::<String, _>(name) {
                             b.append_value(val);
                         } else {
@@ -98,7 +111,7 @@ pub fn rows_to_arrow_ipc(table_name: &str, rows: &[AnyRow]) -> BridgeResult<Vec<
                         let b = builder
                             .as_any_mut()
                             .downcast_mut::<StringBuilder>()
-                            .unwrap();
+                            .ok_or_else(internal_type_err)?;
                         if let Ok(val) = row.try_get::<String, _>(name) {
                             b.append_value(val);
                         } else {
@@ -110,7 +123,7 @@ pub fn rows_to_arrow_ipc(table_name: &str, rows: &[AnyRow]) -> BridgeResult<Vec<
                 let b = builder
                     .as_any_mut()
                     .downcast_mut::<StringBuilder>()
-                    .unwrap();
+                    .ok_or_else(internal_type_err)?;
                 if let Ok(val) = row.try_get::<String, _>(name) {
                     b.append_value(val);
                 } else {
@@ -121,13 +134,33 @@ pub fn rows_to_arrow_ipc(table_name: &str, rows: &[AnyRow]) -> BridgeResult<Vec<
     }
 
     let arrays: Vec<ArrayRef> = builders.into_iter().map(|mut b| b.finish()).collect();
-    let batch = RecordBatch::try_new(schema.clone(), arrays).unwrap();
+    let batch = RecordBatch::try_new(schema.clone(), arrays).map_err(|e| {
+        BridgeError::Internal(
+            format!("Failed to create Arrow RecordBatch: {}", e),
+            DiagnosticInfo::default(),
+        )
+    })?;
 
     let mut buffer = Vec::new();
     {
-        let mut writer = StreamWriter::try_new(&mut buffer, &schema).unwrap();
-        writer.write(&batch).unwrap();
-        writer.finish().unwrap();
+        let mut writer = StreamWriter::try_new(&mut buffer, &schema).map_err(|e| {
+            BridgeError::Internal(
+                format!("Failed to create Arrow StreamWriter: {}", e),
+                DiagnosticInfo::default(),
+            )
+        })?;
+        writer.write(&batch).map_err(|e| {
+            BridgeError::Internal(
+                format!("Failed to write Arrow RecordBatch: {}", e),
+                DiagnosticInfo::default(),
+            )
+        })?;
+        writer.finish().map_err(|e| {
+            BridgeError::Internal(
+                format!("Failed to finish Arrow stream: {}", e),
+                DiagnosticInfo::default(),
+            )
+        })?;
     }
 
     Ok(buffer)
