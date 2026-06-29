@@ -1,19 +1,29 @@
+pub fn catch_panic<F, T>(f: F) -> Result<T, PyErr>
+where
+    F: FnOnce() -> Result<T, PyErr>,
+{
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).unwrap_or_else(|e| {
+        let msg = if let Some(s) = e.downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = e.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "Unknown Rust panic".to_string()
+        };
+        Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+            "Rust panic: {}",
+            msg
+        )))
+    })
+}
+
 #[macro_export]
 macro_rules! ffi_guard {
     ($py:expr, $body:expr) => {
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| $body)).unwrap_or_else(|e| {
-            let msg = if let Some(s) = e.downcast_ref::<&str>() {
-                s.to_string()
-            } else if let Some(s) = e.downcast_ref::<String>() {
-                s.clone()
-            } else {
-                "Unknown Rust panic".to_string()
-            };
-            Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "Rust panic: {}",
-                msg
-            )))
-        })
+        $crate::ffi::catch_panic(|| $body)
+    };
+    ($body:expr) => {
+        $crate::ffi::catch_panic(|| $body)
     };
 }
 
@@ -278,8 +288,10 @@ impl LazyRowStream {
 
 #[pyfunction]
 fn configure_logging(level: String, slow_query_ms: u64) -> PyResult<()> {
-    telemetry::logger::configure_logging(&level, slow_query_ms);
-    Ok(())
+    ffi_guard!({
+        telemetry::logger::configure_logging(&level, slow_query_ms);
+        Ok(())
+    })
 }
 
 #[pyfunction]
@@ -289,19 +301,21 @@ fn connect(
     url: String,
     config: Option<pool_config::PoolConfig>,
 ) -> PyResult<Bound<'_, PyAny>> {
-    let url_clone = url.clone();
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let pool = engine::db::connect(&url_clone, config)
-            .await
-            .map_err(bridge_error_to_py)?;
+    ffi_guard!(py, {
+        let url_clone = url.clone();
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let pool = engine::db::connect(&url_clone, config)
+                .await
+                .map_err(bridge_error_to_py)?;
 
-        let mgr = engine::pool_manager::pool_manager();
-        mgr.register("primary".to_string(), pool, url_clone.clone())
-            .map_err(bridge_error_to_py)?;
-        mgr.set_default("primary".to_string())
-            .map_err(bridge_error_to_py)?;
+            let mgr = engine::pool_manager::pool_manager();
+            mgr.register("primary".to_string(), pool, url_clone.clone())
+                .map_err(bridge_error_to_py)?;
+            mgr.set_default("primary".to_string())
+                .map_err(bridge_error_to_py)?;
 
-        Ok(())
+            Ok(())
+        })
     })
 }
 
@@ -316,60 +330,64 @@ pub struct TableMetaProxy {
 
 #[pyfunction]
 fn reflect_schema(py: Python<'_>) -> PyResult<Bound<'_, PyAny>> {
-    let pt = extract_pool_tx(py, None)?;
-    let pool = pt.pool;
-    let url = pt.url;
+    ffi_guard!(py, {
+        let pt = extract_pool_tx(py, None)?;
+        let pool = pt.pool;
+        let url = pt.url;
 
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let tables = schema::introspect::reflect_schema(&pool, &url)
-            .await
-            .map_err(bridge_error_to_py)?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let tables = schema::introspect::reflect_schema(&pool, &url)
+                .await
+                .map_err(bridge_error_to_py)?;
 
-        let proxies: Vec<TableMetaProxy> = tables
-            .into_iter()
-            .map(|t| TableMetaProxy {
-                name: t.name,
-                columns: t
-                    .columns
-                    .into_iter()
-                    .map(|c| ColumnMetaProxy {
-                        name: c.name,
-                        data_type: c.data_type,
-                        is_nullable: c.is_nullable,
-                        is_primary_key: c.is_primary_key,
-                        default_value: c.default_value,
-                    })
-                    .collect(),
-            })
-            .collect();
+            let proxies: Vec<TableMetaProxy> = tables
+                .into_iter()
+                .map(|t| TableMetaProxy {
+                    name: t.name,
+                    columns: t
+                        .columns
+                        .into_iter()
+                        .map(|c| ColumnMetaProxy {
+                            name: c.name,
+                            data_type: c.data_type,
+                            is_nullable: c.is_nullable,
+                            is_primary_key: c.is_primary_key,
+                            default_value: c.default_value,
+                        })
+                        .collect(),
+                })
+                .collect();
 
-        Ok(proxies)
+            Ok(proxies)
+        })
     })
 }
 
 #[pyfunction]
 fn reflect_table(py: Python<'_>, table_name: String) -> PyResult<Bound<'_, PyAny>> {
-    let pt = extract_pool_tx(py, None)?;
-    let pool = pt.pool;
-    let url = pt.url;
+    ffi_guard!(py, {
+        let pt = extract_pool_tx(py, None)?;
+        let pool = pt.pool;
+        let url = pt.url;
 
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let columns = schema::introspect::reflect_table(&pool, &url, &table_name)
-            .await
-            .map_err(bridge_error_to_py)?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let columns = schema::introspect::reflect_table(&pool, &url, &table_name)
+                .await
+                .map_err(bridge_error_to_py)?;
 
-        let proxies: Vec<ColumnMetaProxy> = columns
-            .into_iter()
-            .map(|c| ColumnMetaProxy {
-                name: c.name,
-                data_type: c.data_type,
-                is_nullable: c.is_nullable,
-                is_primary_key: c.is_primary_key,
-                default_value: c.default_value,
-            })
-            .collect();
+            let proxies: Vec<ColumnMetaProxy> = columns
+                .into_iter()
+                .map(|c| ColumnMetaProxy {
+                    name: c.name,
+                    data_type: c.data_type,
+                    is_nullable: c.is_nullable,
+                    is_primary_key: c.is_primary_key,
+                    default_value: c.default_value,
+                })
+                .collect();
 
-        Ok(proxies)
+            Ok(proxies)
+        })
     })
 }
 
@@ -381,32 +399,34 @@ fn insert_row<'py>(
     data: Bound<'py, PyDict>,
     tx: Option<PyObject>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let pt = extract_pool_tx(py, tx.as_ref())?;
-    let pool = pt.pool;
-    let url = pt.url;
-    let tx_mutex = pt.tx_mutex;
+    ffi_guard!(py, {
+        let pt = extract_pool_tx(py, tx.as_ref())?;
+        let pool = pt.pool;
+        let url = pt.url;
+        let tx_mutex = pt.tx_mutex;
 
-    let table_clone = table.clone();
-    let mut query_data: HashMap<String, QueryValue> = HashMap::new();
-    for (k, v) in data {
-        let key = k.extract::<String>()?;
-        query_data.insert(
-            key.clone(),
-            py_to_query_value(py, &v, &table_clone, &key).map_err(bridge_error_to_py)?,
-        );
-    }
+        let table_clone = table.clone();
+        let mut query_data: HashMap<String, QueryValue> = HashMap::new();
+        for (k, v) in data {
+            let key = k.extract::<String>()?;
+            query_data.insert(
+                key.clone(),
+                py_to_query_value(py, &v, &table_clone, &key).map_err(bridge_error_to_py)?,
+            );
+        }
 
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let res = engine::db::generic_insert(&pool, tx_mutex.as_ref(), &url, &table, query_data)
-            .await
-            .map_err(bridge_error_to_py)?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let res = engine::db::generic_insert(&pool, tx_mutex.as_ref(), &url, &table, query_data)
+                .await
+                .map_err(bridge_error_to_py)?;
 
-        Python::with_gil(|py| {
-            let dict = PyDict::new_bound(py);
-            for (k, v) in res {
-                dict.set_item(k, query_value_to_py(py, v)?)?;
-            }
-            Ok(dict.to_object(py))
+            Python::with_gil(|py| {
+                let dict = PyDict::new_bound(py);
+                for (k, v) in res {
+                    dict.set_item(k, query_value_to_py(py, v)?)?;
+                }
+                Ok(dict.to_object(py))
+            })
         })
     })
 }
@@ -472,39 +492,41 @@ fn fetch_all_arrow<'py>(
     fields: Option<Vec<String>>,
     tx: Option<PyObject>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let pt = extract_pool_tx(py, tx.as_ref())?;
-    let pool = pt.pool;
-    let url = pt.url;
-    let tx_mutex = pt.tx_mutex;
+    ffi_guard!(py, {
+        let pt = extract_pool_tx(py, tx.as_ref())?;
+        let pool = pt.pool;
+        let url = pt.url;
+        let tx_mutex = pt.tx_mutex;
 
-    let table_clone = table.clone();
-    let mut query_filters: HashMap<String, QueryValue> = HashMap::new();
-    for (k, v) in filters {
-        let key = k.extract::<String>()?;
-        query_filters.insert(
-            key.clone(),
-            py_to_query_value(py, &v, &table_clone, &key).map_err(bridge_error_to_py)?,
-        );
-    }
+        let table_clone = table.clone();
+        let mut query_filters: HashMap<String, QueryValue> = HashMap::new();
+        for (k, v) in filters {
+            let key = k.extract::<String>()?;
+            query_filters.insert(
+                key.clone(),
+                py_to_query_value(py, &v, &table_clone, &key).map_err(bridge_error_to_py)?,
+            );
+        }
 
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let rows = engine::db::generic_query(
-            &pool,
-            tx_mutex.as_ref(),
-            &url,
-            &table,
-            query_filters,
-            limit,
-            fields,
-        )
-        .await
-        .map_err(bridge_error_to_py)?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let rows = engine::db::generic_query(
+                &pool,
+                tx_mutex.as_ref(),
+                &url,
+                &table,
+                query_filters,
+                limit,
+                fields,
+            )
+            .await
+            .map_err(bridge_error_to_py)?;
 
-        let buffer = engine::arrow::rows_to_arrow_ipc(&table, &rows).map_err(bridge_error_to_py)?;
+            let buffer = engine::arrow::rows_to_arrow_ipc(&table, &rows).map_err(bridge_error_to_py)?;
 
-        Python::with_gil(|py| {
-            let bytes = PyBytes::new_bound(py, &buffer);
-            Ok(bytes.to_object(py))
+            Python::with_gil(|py| {
+                let bytes = PyBytes::new_bound(py, &buffer);
+                Ok(bytes.to_object(py))
+            })
         })
     })
 }
@@ -520,41 +542,43 @@ fn fetch_all<'py>(
     eager_loads: Option<Vec<Bound<'py, PyDict>>>,
     tx: Option<PyObject>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let pt = extract_pool_tx(py, tx.as_ref())?;
-    let pool = pt.pool;
-    let url = pt.url;
-    let tx_mutex = pt.tx_mutex;
+    ffi_guard!(py, {
+        let pt = extract_pool_tx(py, tx.as_ref())?;
+        let pool = pt.pool;
+        let url = pt.url;
+        let tx_mutex = pt.tx_mutex;
 
-    let table_clone = table.clone();
-    let mut query_filters: HashMap<String, QueryValue> = HashMap::new();
-    for (k, v) in filters {
-        let key = k.extract::<String>()?;
-        query_filters.insert(
-            key.clone(),
-            py_to_query_value(py, &v, &table_clone, &key).map_err(bridge_error_to_py)?,
-        );
-    }
+        let table_clone = table.clone();
+        let mut query_filters: HashMap<String, QueryValue> = HashMap::new();
+        for (k, v) in filters {
+            let key = k.extract::<String>()?;
+            query_filters.insert(
+                key.clone(),
+                py_to_query_value(py, &v, &table_clone, &key).map_err(bridge_error_to_py)?,
+            );
+        }
 
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let rows = engine::db::generic_query(
-            &pool,
-            tx_mutex.as_ref(),
-            &url,
-            &table,
-            query_filters,
-            limit,
-            fields,
-        )
-        .await
-        .map_err(bridge_error_to_py)?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let rows = engine::db::generic_query(
+                &pool,
+                tx_mutex.as_ref(),
+                &url,
+                &table,
+                query_filters,
+                limit,
+                fields,
+            )
+            .await
+            .map_err(bridge_error_to_py)?;
 
-        Python::with_gil(|py| {
-            let mut results = Vec::new();
-            for row in rows {
-                let dict = engine::hydrator::hydrate_row(py, &table, &row)?;
-                results.push(dict.to_object(py));
-            }
-            Ok(results)
+            Python::with_gil(|py| {
+                let mut results = Vec::new();
+                for row in rows {
+                    let dict = engine::hydrator::hydrate_row(py, &table, &row)?;
+                    results.push(dict.to_object(py));
+                }
+                Ok(results)
+            })
         })
     })
 }
@@ -604,50 +628,58 @@ fn delete_row<'py>(
     filters: Bound<'py, PyDict>,
     tx: Option<PyObject>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let pt = extract_pool_tx(py, tx.as_ref())?;
-    let pool = pt.pool;
-    let url = pt.url;
-    let tx_mutex = pt.tx_mutex;
+    ffi_guard!(py, {
+        let pt = extract_pool_tx(py, tx.as_ref())?;
+        let pool = pt.pool;
+        let url = pt.url;
+        let tx_mutex = pt.tx_mutex;
 
-    let table_clone = table.clone();
-    let mut query_filters: HashMap<String, QueryValue> = HashMap::new();
-    for (k, v) in filters {
-        let key = k.extract::<String>()?;
-        query_filters.insert(
-            key.clone(),
-            py_to_query_value(py, &v, &table_clone, &key).map_err(bridge_error_to_py)?,
-        );
-    }
+        let table_clone = table.clone();
+        let mut query_filters: HashMap<String, QueryValue> = HashMap::new();
+        for (k, v) in filters {
+            let key = k.extract::<String>()?;
+            query_filters.insert(
+                key.clone(),
+                py_to_query_value(py, &v, &table_clone, &key).map_err(bridge_error_to_py)?,
+            );
+        }
 
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        engine::db::generic_delete(&pool, tx_mutex.as_ref(), &url, &table, query_filters)
-            .await
-            .map_err(bridge_error_to_py)
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            engine::db::generic_delete(&pool, tx_mutex.as_ref(), &url, &table, query_filters)
+                .await
+                .map_err(bridge_error_to_py)
+        })
     })
 }
 
 #[cfg(feature = "allow-raw-sql")]
 #[pyfunction]
 fn execute_raw(py: Python<'_>, sql: String) -> PyResult<Bound<'_, PyAny>> {
-    let pt = extract_pool_tx(py, None)?;
-    let pool = pt.pool;
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        engine::db::execute_raw(&pool, &sql)
-            .await
-            .map_err(bridge_error_to_py)?;
-        Ok(())
+    ffi_guard!(py, {
+        let pt = extract_pool_tx(py, None)?;
+        let pool = pt.pool;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            engine::db::execute_raw(&pool, &sql)
+                .await
+                .map_err(bridge_error_to_py)?;
+            Ok(())
+        })
     })
 }
 
 #[pyfunction]
 fn resolve_type(py_type: String, dialect: String) -> PyResult<String> {
-    engine::db::resolve_python_type_to_sql(&py_type, &dialect).map_err(bridge_error_to_py)
+    ffi_guard!({
+        engine::db::resolve_python_type_to_sql(&py_type, &dialect).map_err(bridge_error_to_py)
+    })
 }
 
 #[pyfunction]
 fn set_telemetry_logger(logger: PyObject) -> PyResult<()> {
-    telemetry::logger::set_python_logger(logger);
-    Ok(())
+    ffi_guard!({
+        telemetry::logger::set_python_logger(logger);
+        Ok(())
+    })
 }
 
 #[pyfunction]
@@ -658,41 +690,43 @@ fn insert_rows_bulk<'py>(
     items: Vec<Bound<'py, PyDict>>,
     tx: Option<PyObject>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let pt = extract_pool_tx(py, tx.as_ref())?;
-    let pool = pt.pool;
-    let url = pt.url;
-    let tx_mutex = pt.tx_mutex;
+    ffi_guard!(py, {
+        let pt = extract_pool_tx(py, tx.as_ref())?;
+        let pool = pt.pool;
+        let url = pt.url;
+        let tx_mutex = pt.tx_mutex;
 
-    let table_clone = table.clone();
-    let mut query_items: Vec<HashMap<String, QueryValue>> = Vec::new();
-    for item in items {
-        let mut query_item = HashMap::new();
-        for (k, v) in item {
-            let key = k.extract::<String>()?;
-            query_item.insert(
-                key.clone(),
-                py_to_query_value(py, &v, &table_clone, &key).map_err(bridge_error_to_py)?,
-            );
-        }
-        query_items.push(query_item);
-    }
-
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let res =
-            engine::db::generic_insert_bulk(&pool, tx_mutex.as_ref(), &url, &table, query_items)
-                .await
-                .map_err(bridge_error_to_py)?;
-
-        Python::with_gil(|py| {
-            let mut results = Vec::new();
-            for item in res {
-                let dict = PyDict::new_bound(py);
-                for (k, v) in item {
-                    dict.set_item(k, query_value_to_py(py, v)?)?;
-                }
-                results.push(dict.to_object(py));
+        let table_clone = table.clone();
+        let mut query_items: Vec<HashMap<String, QueryValue>> = Vec::new();
+        for item in items {
+            let mut query_item = HashMap::new();
+            for (k, v) in item {
+                let key = k.extract::<String>()?;
+                query_item.insert(
+                    key.clone(),
+                    py_to_query_value(py, &v, &table_clone, &key).map_err(bridge_error_to_py)?,
+                );
             }
-            Ok(results)
+            query_items.push(query_item);
+        }
+
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let res =
+                engine::db::generic_insert_bulk(&pool, tx_mutex.as_ref(), &url, &table, query_items)
+                    .await
+                    .map_err(bridge_error_to_py)?;
+
+            Python::with_gil(|py| {
+                let mut results = Vec::new();
+                for item in res {
+                    let dict = PyDict::new_bound(py);
+                    for (k, v) in item {
+                        dict.set_item(k, query_value_to_py(py, v)?)?;
+                    }
+                    results.push(dict.to_object(py));
+                }
+                Ok(results)
+            })
         })
     })
 }
@@ -706,30 +740,32 @@ fn fetch_one_to_many(
     parent_id: String,
     tx: Option<PyObject>,
 ) -> PyResult<Bound<'_, PyAny>> {
-    let pt = extract_pool_tx(py, tx.as_ref())?;
-    let pool = pt.pool;
-    let url = pt.url;
-    let tx_mutex = pt.tx_mutex;
+    ffi_guard!(py, {
+        let pt = extract_pool_tx(py, tx.as_ref())?;
+        let pool = pt.pool;
+        let url = pt.url;
+        let tx_mutex = pt.tx_mutex;
 
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let rows = engine::relations::fetch_one_to_many(
-            &pool,
-            tx_mutex.as_ref(),
-            &url,
-            &table,
-            &foreign_key,
-            &parent_id,
-        )
-        .await
-        .map_err(bridge_error_to_py)?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let rows = engine::relations::fetch_one_to_many(
+                &pool,
+                tx_mutex.as_ref(),
+                &url,
+                &table,
+                &foreign_key,
+                &parent_id,
+            )
+            .await
+            .map_err(bridge_error_to_py)?;
 
-        Python::with_gil(|py| {
-            let mut results = Vec::new();
-            for row in rows {
-                let dict = engine::hydrator::hydrate_row(py, &table, &row)?;
-                results.push(dict.to_object(py));
-            }
-            Ok(results)
+            Python::with_gil(|py| {
+                let mut results = Vec::new();
+                for row in rows {
+                    let dict = engine::hydrator::hydrate_row(py, &table, &row)?;
+                    results.push(dict.to_object(py));
+                }
+                Ok(results)
+            })
         })
     })
 }
@@ -745,32 +781,34 @@ fn fetch_many_to_many(
     parent_id: String,
     tx: Option<PyObject>,
 ) -> PyResult<Bound<'_, PyAny>> {
-    let pt = extract_pool_tx(py, tx.as_ref())?;
-    let pool = pt.pool;
-    let url = pt.url;
-    let tx_mutex = pt.tx_mutex;
+    ffi_guard!(py, {
+        let pt = extract_pool_tx(py, tx.as_ref())?;
+        let pool = pt.pool;
+        let url = pt.url;
+        let tx_mutex = pt.tx_mutex;
 
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let rows = engine::relations::fetch_many_to_many(
-            &pool,
-            tx_mutex.as_ref(),
-            &url,
-            &target_table,
-            &junction_table,
-            &left_key,
-            &right_key,
-            &parent_id,
-        )
-        .await
-        .map_err(bridge_error_to_py)?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let rows = engine::relations::fetch_many_to_many(
+                &pool,
+                tx_mutex.as_ref(),
+                &url,
+                &target_table,
+                &junction_table,
+                &left_key,
+                &right_key,
+                &parent_id,
+            )
+            .await
+            .map_err(bridge_error_to_py)?;
 
-        Python::with_gil(|py| {
-            let mut results = Vec::new();
-            for row in rows {
-                let dict = engine::hydrator::hydrate_row(py, &target_table, &row)?;
-                results.push(dict.to_object(py));
-            }
-            Ok(results)
+            Python::with_gil(|py| {
+                let mut results = Vec::new();
+                for row in rows {
+                    let dict = engine::hydrator::hydrate_row(py, &target_table, &row)?;
+                    results.push(dict.to_object(py));
+                }
+                Ok(results)
+            })
         })
     })
 }
@@ -784,30 +822,32 @@ fn fetch_self_ref(
     parent_id: String,
     tx: Option<PyObject>,
 ) -> PyResult<Bound<'_, PyAny>> {
-    let pt = extract_pool_tx(py, tx.as_ref())?;
-    let pool = pt.pool;
-    let url = pt.url;
-    let tx_mutex = pt.tx_mutex;
+    ffi_guard!(py, {
+        let pt = extract_pool_tx(py, tx.as_ref())?;
+        let pool = pt.pool;
+        let url = pt.url;
+        let tx_mutex = pt.tx_mutex;
 
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let rows = engine::relations::fetch_self_ref(
-            &pool,
-            tx_mutex.as_ref(),
-            &url,
-            &table,
-            &parent_key,
-            &parent_id,
-        )
-        .await
-        .map_err(bridge_error_to_py)?;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let rows = engine::relations::fetch_self_ref(
+                &pool,
+                tx_mutex.as_ref(),
+                &url,
+                &table,
+                &parent_key,
+                &parent_id,
+            )
+            .await
+            .map_err(bridge_error_to_py)?;
 
-        Python::with_gil(|py| {
-            let mut results = Vec::new();
-            for row in rows {
-                let dict = engine::hydrator::hydrate_row(py, &table, &row)?;
-                results.push(dict.to_object(py));
-            }
-            Ok(results)
+            Python::with_gil(|py| {
+                let mut results = Vec::new();
+                for row in rows {
+                    let dict = engine::hydrator::hydrate_row(py, &table, &row)?;
+                    results.push(dict.to_object(py));
+                }
+                Ok(results)
+            })
         })
     })
 }
@@ -821,34 +861,36 @@ fn batch_fetch_one_to_many<'py>(
     parent_ids: Vec<String>,
     tx: Option<PyObject>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let pt = extract_pool_tx(py, tx.as_ref())?;
-    let pool = pt.pool;
-    let url = pt.url;
-    let tx_mutex = pt.tx_mutex;
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let grouped = engine::relations::batch_fetch_one_to_many(
-            &pool,
-            tx_mutex.as_ref(),
-            &url,
-            &child_table,
-            &foreign_key,
-            &parent_ids,
-        )
-        .await
-        .map_err(bridge_error_to_py)?;
-        Python::with_gil(|py| {
-            let result_dict = PyDict::new_bound(py);
-            for (parent_id, rows) in grouped {
-                let row_list: Vec<PyObject> = rows
-                    .iter()
-                    .map(|row| {
-                        engine::hydrator::hydrate_row(py, &child_table, row)
-                            .map(|d| d.to_object(py))
-                    })
-                    .collect::<PyResult<Vec<_>>>()?;
-                result_dict.set_item(&parent_id, row_list)?;
-            }
-            Ok(result_dict.to_object(py))
+    ffi_guard!(py, {
+        let pt = extract_pool_tx(py, tx.as_ref())?;
+        let pool = pt.pool;
+        let url = pt.url;
+        let tx_mutex = pt.tx_mutex;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let grouped = engine::relations::batch_fetch_one_to_many(
+                &pool,
+                tx_mutex.as_ref(),
+                &url,
+                &child_table,
+                &foreign_key,
+                &parent_ids,
+            )
+            .await
+            .map_err(bridge_error_to_py)?;
+            Python::with_gil(|py| {
+                let result_dict = PyDict::new_bound(py);
+                for (parent_id, rows) in grouped {
+                    let row_list: Vec<PyObject> = rows
+                        .iter()
+                        .map(|row| {
+                            engine::hydrator::hydrate_row(py, &child_table, row)
+                                .map(|d| d.to_object(py))
+                        })
+                        .collect::<PyResult<Vec<_>>>()?;
+                    result_dict.set_item(&parent_id, row_list)?;
+                }
+                Ok(result_dict.to_object(py))
+            })
         })
     })
 }
@@ -864,36 +906,38 @@ fn batch_fetch_many_to_many<'py>(
     parent_ids: Vec<String>,
     tx: Option<PyObject>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let pt = extract_pool_tx(py, tx.as_ref())?;
-    let pool = pt.pool;
-    let url = pt.url;
-    let tx_mutex = pt.tx_mutex;
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let grouped = engine::relations::batch_fetch_many_to_many(
-            &pool,
-            tx_mutex.as_ref(),
-            &url,
-            &target_table,
-            &junction_table,
-            &left_key,
-            &right_key,
-            &parent_ids,
-        )
-        .await
-        .map_err(bridge_error_to_py)?;
-        Python::with_gil(|py| {
-            let result_dict = PyDict::new_bound(py);
-            for (parent_id, rows) in grouped {
-                let row_list: Vec<PyObject> = rows
-                    .iter()
-                    .map(|row| {
-                        engine::hydrator::hydrate_row(py, &target_table, row)
-                            .map(|d| d.to_object(py))
-                    })
-                    .collect::<PyResult<Vec<_>>>()?;
-                result_dict.set_item(&parent_id, row_list)?;
-            }
-            Ok(result_dict.to_object(py))
+    ffi_guard!(py, {
+        let pt = extract_pool_tx(py, tx.as_ref())?;
+        let pool = pt.pool;
+        let url = pt.url;
+        let tx_mutex = pt.tx_mutex;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let grouped = engine::relations::batch_fetch_many_to_many(
+                &pool,
+                tx_mutex.as_ref(),
+                &url,
+                &target_table,
+                &junction_table,
+                &left_key,
+                &right_key,
+                &parent_ids,
+            )
+            .await
+            .map_err(bridge_error_to_py)?;
+            Python::with_gil(|py| {
+                let result_dict = PyDict::new_bound(py);
+                for (parent_id, rows) in grouped {
+                    let row_list: Vec<PyObject> = rows
+                        .iter()
+                        .map(|row| {
+                            engine::hydrator::hydrate_row(py, &target_table, row)
+                                .map(|d| d.to_object(py))
+                        })
+                        .collect::<PyResult<Vec<_>>>()?;
+                    result_dict.set_item(&parent_id, row_list)?;
+                }
+                Ok(result_dict.to_object(py))
+            })
         })
     })
 }
@@ -907,33 +951,35 @@ fn batch_fetch_self_ref<'py>(
     parent_ids: Vec<String>,
     tx: Option<PyObject>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let pt = extract_pool_tx(py, tx.as_ref())?;
-    let pool = pt.pool;
-    let url = pt.url;
-    let tx_mutex = pt.tx_mutex;
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let grouped = engine::relations::batch_fetch_self_ref(
-            &pool,
-            tx_mutex.as_ref(),
-            &url,
-            &table,
-            &parent_key,
-            &parent_ids,
-        )
-        .await
-        .map_err(bridge_error_to_py)?;
-        Python::with_gil(|py| {
-            let result_dict = PyDict::new_bound(py);
-            for (parent_id, rows) in grouped {
-                let row_list: Vec<PyObject> = rows
-                    .iter()
-                    .map(|row| {
-                        engine::hydrator::hydrate_row(py, &table, row).map(|d| d.to_object(py))
-                    })
-                    .collect::<PyResult<Vec<_>>>()?;
-                result_dict.set_item(&parent_id, row_list)?;
-            }
-            Ok(result_dict.to_object(py))
+    ffi_guard!(py, {
+        let pt = extract_pool_tx(py, tx.as_ref())?;
+        let pool = pt.pool;
+        let url = pt.url;
+        let tx_mutex = pt.tx_mutex;
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let grouped = engine::relations::batch_fetch_self_ref(
+                &pool,
+                tx_mutex.as_ref(),
+                &url,
+                &table,
+                &parent_key,
+                &parent_ids,
+            )
+            .await
+            .map_err(bridge_error_to_py)?;
+            Python::with_gil(|py| {
+                let result_dict = PyDict::new_bound(py);
+                for (parent_id, rows) in grouped {
+                    let row_list: Vec<PyObject> = rows
+                        .iter()
+                        .map(|row| {
+                            engine::hydrator::hydrate_row(py, &table, row).map(|d| d.to_object(py))
+                        })
+                        .collect::<PyResult<Vec<_>>>()?;
+                    result_dict.set_item(&parent_id, row_list)?;
+                }
+                Ok(result_dict.to_object(py))
+            })
         })
     })
 }
@@ -941,34 +987,38 @@ fn batch_fetch_self_ref<'py>(
 #[pyfunction]
 #[pyo3(signature = (pool_key=None))]
 fn begin_transaction(py: Python<'_>, pool_key: Option<String>) -> PyResult<Bound<'_, PyAny>> {
-    let mgr = engine::pool_manager::pool_manager();
-    let (pool, url) = mgr
-        .get(pool_key.as_deref())
-        .map_err(bridge_error_to_py)?
-        .ok_or_else(|| PyException::new_err("Connection pool not initialized"))?;
+    ffi_guard!(py, {
+        let mgr = engine::pool_manager::pool_manager();
+        let (pool, url) = mgr
+            .get(pool_key.as_deref())
+            .map_err(bridge_error_to_py)?
+            .ok_or_else(|| PyException::new_err("Connection pool not initialized"))?;
 
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let tx = engine::transaction::begin_transaction(&pool, &url)
-            .await
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(tx)
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let tx = engine::transaction::begin_transaction(&pool, &url)
+                .await
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            Ok(tx)
+        })
     })
 }
 
 #[pyfunction]
 #[pyo3(signature = (pool_key=None))]
 fn begin_session(py: Python<'_>, pool_key: Option<String>) -> PyResult<Bound<'_, PyAny>> {
-    let mgr = engine::pool_manager::pool_manager();
-    let (pool, url) = mgr
-        .get(pool_key.as_deref())
-        .map_err(bridge_error_to_py)?
-        .ok_or_else(|| PyException::new_err("Connection pool not initialized"))?;
+    ffi_guard!(py, {
+        let mgr = engine::pool_manager::pool_manager();
+        let (pool, url) = mgr
+            .get(pool_key.as_deref())
+            .map_err(bridge_error_to_py)?
+            .ok_or_else(|| PyException::new_err("Connection pool not initialized"))?;
 
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let session = engine::session::begin_session(pool, url)
-            .await
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(session)
+        pyo3_async_runtimes::tokio::future_into_py(py, async move {
+            let session = engine::session::begin_session(pool, url)
+                .await
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            Ok(session)
+        })
     })
 }
 
@@ -980,15 +1030,17 @@ fn snapshot_entity(
     table_name: String,
     values: Bound<'_, PyDict>,
 ) -> PyResult<()> {
-    let mut query_values = HashMap::new();
-    for (k, v) in values {
-        let key = k.extract::<String>()?;
-        query_values.insert(
-            key.clone(),
-            py_to_query_value(py, &v, &table_name, &key).map_err(bridge_error_to_py)?,
-        );
-    }
-    session.snapshot_entity_internal(key, table_name, query_values)
+    ffi_guard!(py, {
+        let mut query_values = HashMap::new();
+        for (k, v) in values {
+            let key = k.extract::<String>()?;
+            query_values.insert(
+                key.clone(),
+                py_to_query_value(py, &v, &table_name, &key).map_err(bridge_error_to_py)?,
+            );
+        }
+        session.snapshot_entity_internal(key, table_name, query_values)
+    })
 }
 
 #[pyfunction]

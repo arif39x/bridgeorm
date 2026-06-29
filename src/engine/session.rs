@@ -7,6 +7,11 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use tokio::sync::Mutex as TokioMutex;
 
+/// Lock ordering (must be followed by all code paths that acquire both):
+///   1. `identity_map`  (lock first)
+///   2. `dirty_tracker` (lock second)
+/// Acquiring these in reverse order will cause a deadlock.
+
 #[pyclass]
 #[derive(Clone)]
 pub struct Session {
@@ -35,12 +40,12 @@ impl Session {
     }
 
     pub fn remove_entity(&self, _py: Python<'_>, key: String) -> PyResult<()> {
+        // Lock order: identity_map (1) -> dirty_tracker (2)
         let mut map = self.identity_map.lock().map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("Lock poisoned: {}", e))
         })?;
         map.remove(&key);
 
-        // Also remove snapshot when entity is removed from identity map
         let mut tracker = self.dirty_tracker.lock().map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("Lock poisoned: {}", e))
         })?;
@@ -49,6 +54,7 @@ impl Session {
     }
 
     pub fn clear_identity_map(&self) -> PyResult<()> {
+        // Lock order: identity_map (1) -> dirty_tracker (2)
         let mut map = self.identity_map.lock().map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("Lock poisoned: {}", e))
         })?;
@@ -62,6 +68,7 @@ impl Session {
     }
 
     pub fn get_stats(&self) -> PyResult<HashMap<String, usize>> {
+        // Lock order: identity_map (1) -> dirty_tracker (2)
         let map = self.identity_map.lock().map_err(|e| {
             pyo3::exceptions::PyRuntimeError::new_err(format!("Lock poisoned: {}", e))
         })?;
