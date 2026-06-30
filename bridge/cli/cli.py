@@ -82,8 +82,9 @@ async def main():
                     sql = sql_file.read()
                     print(f"Applying {f}...")
                     await execute_raw(sql)
+                    escaped = f.replace("'", "''")
                     await execute_raw(
-                        f"INSERT INTO _bridge_migrations (name) VALUES ('{f}')"
+                        f"INSERT INTO _bridge_migrations (name) VALUES ('{escaped}')"
                     )
             except Exception as e:
                 if "UNIQUE constraint failed" in str(e):
