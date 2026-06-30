@@ -292,9 +292,11 @@ class BaseModel:
 
     def to_xml(self) -> str:
         # Serialize model instance to a basic XML string.
+        from xml.sax.saxutils import escape
+
         data = self.to_dict()
         lines = [f"<{self.table}>"]
         for k, v in data.items():
-            lines.append(f"  <{k}>{v}</{k}>")
+            lines.append(f"  <{k}>{escape(str(v))}</{k}>")
         lines.append(f"</{self.table}>")
         return "\n".join(lines)
