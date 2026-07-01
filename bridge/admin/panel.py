@@ -3,9 +3,12 @@ from typing import Type, List, Optional
 from fastapi import FastAPI, APIRouter, Request, Depends, HTTPException
 from fastapi.responses import HTMLResponse
 from ..core.base import BaseModel, _MODEL_REGISTRY
-from .auth import get_current_user, User, SECRET_KEY, ALGORITHM
+from .auth import get_current_user, User, SECRET_KEY, ALGORITHM, verify_credentials
+from .csrf import generate_csrf_token, CSRF_COOKIE_NAME, csrf_protect
+from .ratelimit import rate_limit
 from .views import router as api_router
 import jwt
+
 
 class AdminPanel:
     def __init__(self, title: str = "Bridge Admin"):
@@ -22,20 +25,32 @@ class AdminPanel:
         @self.router.post("/login")
         async def login(request: Request):
             form = await request.form()
-            username = form.get("username")
-            if username == "admin" or username == "viewer":
-                roles = ["admin"] if username == "admin" else ["viewer"]
-                payload = {
-                    "sub": username,
-                    "roles": roles,
-                    "exp": datetime.utcnow() + timedelta(hours=24),
-                }
-                token = jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
-                return {"access_token": token, "token_type": "bearer"}
-            raise HTTPException(status_code=400, detail="Invalid credentials")
+            username = form.get("username", "")
+            password = form.get("password", "")
+
+            user = verify_credentials(username, password)
+            if user is None:
+                raise HTTPException(status_code=401, detail="Invalid credentials")
+
+            payload = {
+                "sub": user.username,
+                "roles": user.roles,
+                "exp": datetime.utcnow() + timedelta(hours=24),
+            }
+            token = jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+            return {"access_token": token, "token_type": "bearer"}
+
+        @self.router.get("/csrf-token")
+        async def get_csrf_token():
+            token = generate_csrf_token()
+            return {
+                CSRF_COOKIE_NAME: token,
+                "token": token,
+            }
 
         @self.router.get("/", response_class=HTMLResponse)
         async def admin_index(request: Request):
+            csrf_token = generate_csrf_token()
             model_links = "".join([f'<li><a href="/admin/{m.table}">{m.__name__}</a></li>' for m in self.models])
             return f"""
             <html>
@@ -43,11 +58,14 @@ class AdminPanel:
                 <body>
                     <h1>{self.title}</h1>
                     <ul>{model_links}</ul>
+                    <script>
+                        document.cookie = "{CSRF_COOKIE_NAME}={csrf_token}; path=/; SameSite=Strict";
+                    </script>
                 </body>
             </html>
             """
 
-        @self.router.get("/{{table}}", response_class=HTMLResponse)
+        @self.router.get("/{table}", response_class=HTMLResponse)
         async def admin_model_list(table: str):
             model_cls = _MODEL_REGISTRY.get(table)
             if not model_cls:
